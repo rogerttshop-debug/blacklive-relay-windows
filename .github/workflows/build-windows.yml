@@ -24,6 +24,8 @@ jobs:
         pip install pyinstaller
 
     - name: Build with PyInstaller
+      env:
+        PYTHONIOENCODING: utf8
       run: |
         python build.py
 
