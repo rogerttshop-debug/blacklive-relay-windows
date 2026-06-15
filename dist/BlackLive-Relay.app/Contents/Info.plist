@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>BlackLive-Relay</string>
+	<key>CFBundleExecutable</key>
+	<string>BlackLive-Relay</string>
+	<key>CFBundleIconFile</key>
+	<string>generated-2e31a2e5b767022bcd7045280aaebb13e0060a7c696654107f0e5d1eb34686cd.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>BlackLive-Relay</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>BlackLive-Relay</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>

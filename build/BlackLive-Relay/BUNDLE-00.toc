@@ -1,0 +1,3 @@
+([('BlackLive-Relay',
+   '/Users/johne/Desktop/jarvis/agente_de_live/black_live/relay_local/dist/BlackLive-Relay',
+   'EXECUTABLE')],)

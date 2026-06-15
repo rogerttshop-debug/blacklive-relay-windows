@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BlackLive Relay — Teste Local</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0f0f0f;
+    color: #fff;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .card {
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 16px;
+    padding: 32px;
+    width: 100%;
+    max-width: 480px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #666; font-size: 13px; margin-bottom: 28px; }
+
+  /* Indicador de status do relay */
+  .relay-badge {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 24px;
+    transition: all 0.3s;
+  }
+  .relay-badge.checking  { background: #1e293b; color: #64748b; border: 1px solid #2a2a2a; }
+  .relay-badge.connected { background: #052e16; color: #22c55e; border: 1px solid #166534; }
+  .relay-badge.vps       { background: #1e1b4b; color: #818cf8; border: 1px solid #3730a3; }
+
+  .dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .dot.pulse {
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.8); }
+  }
+  .dot.green  { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+  .dot.blue   { background: #818cf8; }
+  .dot.gray   { background: #475569; }
+
+  /* Campos */
+  .group { margin-bottom: 16px; }
+  label { display: block; font-size: 12px; color: #666; margin-bottom: 6px; }
+  input {
+    width: 100%;
+    background: #111;
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+    padding: 10px 14px;
+    color: #fff;
+    font-size: 14px;
+    font-family: monospace;
+    outline: none;
+    transition: border 0.2s;
+  }
+  input:focus { border-color: #22c55e; }
+
+  /* Botões */
+  .btn {
+    width: 100%;
+    padding: 13px;
+    border-radius: 10px;
+    border: none;
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s;
+    margin-bottom: 10px;
+  }
+  .btn-green  { background: #22c55e; color: #000; }
+  .btn-green:hover  { background: #16a34a; }
+  .btn-green:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-red    { background: #ef4444; color: #fff; display: none; }
+  .btn-red:hover    { background: #dc2626; }
+  .btn-outline { background: transparent; color: #666; border: 1px solid #2a2a2a; }
+  .btn-outline:hover { background: #1a1a1a; color: #fff; border-color: #444; }
+
+  /* Log */
+  .log {
+    background: #111;
+    border: 1px solid #1e1e1e;
+    border-radius: 8px;
+    padding: 12px;
+    font-family: monospace;
+    font-size: 12px;
+    color: #4ade80;
+    max-height: 160px;
+    overflow-y: auto;
+    margin-top: 16px;
+    line-height: 1.6;
+  }
+  .log .err { color: #ef4444; }
+  .log .info { color: #64748b; }
+
+  /* Rota selecionada */
+  .route-info {
+    font-size: 12px;
+    color: #475569;
+    text-align: center;
+    margin-top: 8px;
+  }
+  .route-info span { color: #22c55e; font-weight: 600; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h1>🛰️ BlackLive Relay — Teste Local</h1>
+  <p class="sub">Testa a detecção automática do relay e a transmissão</p>
+
+  <!-- Badge de status do relay -->
+  <div class="relay-badge checking" id="relayBadge">
+    <div class="dot gray pulse" id="relayDot"></div>
+    <span id="relayLabel">Verificando relay local...</span>
+  </div>
+
+  <!-- Campos RTMP -->
+  <div class="group">
+    <label>URL RTMP</label>
+    <input id="iUrl" type="text" value="rtmp://push-rtmp-l1-sg01.tiktokcdn.com/stage/" placeholder="rtmp://..."/>
+  </div>
+  <div class="group">
+    <label>Chave do Stream</label>
+    <input id="iKey" type="text" value="live_TESTE_123" placeholder="live_xxxxxxxxx"/>
+  </div>
+
+  <!-- Botões -->
+  <button class="btn btn-green" id="btnStart" onclick="iniciarStream()">
+    ▶ Iniciar Transmissão
+  </button>
+  <button class="btn btn-red" id="btnStop" onclick="pararStream()">
+    ■ Parar Transmissão
+  </button>
+  <button class="btn btn-outline" onclick="checkRelay()">
+    🔄 Verificar Relay Novamente
+  </button>
+
+  <div class="route-info" id="routeInfo">
+    Rota: <span id="routeSpan">aguardando...</span>
+  </div>
+
+  <!-- Log de eventos -->
+  <div class="log" id="log">
+    <div class="info">Iniciando verificação do relay...</div>
+  </div>
+</div>
+
+<script>
+// ── Variáveis de estado ──────────────────────────────────────────────
+let relayAtivo   = false;  // relay local detectado?
+let wsRelay      = null;   // WebSocket aberto (relay local)
+let wsVps        = null;   // WebSocket aberto (VPS)
+let recorder     = null;   // MediaRecorder
+let streaming    = false;
+
+const RELAY_PORT = 8902;
+const RELAY_PING = `ws://localhost:${RELAY_PORT}/ping`;
+
+// ── Log ───────────────────────────────────────────────────────────────
+function addLog(msg, tipo = '') {
+  const d = document.getElementById('log');
+  const line = document.createElement('div');
+  if (tipo) line.className = tipo;
+  const now = new Date().toLocaleTimeString('pt-BR');
+  line.textContent = `[${now}] ${msg}`;
+  d.appendChild(line);
+  d.scrollTop = d.scrollHeight;
+}
+
+// ── Verifica se o relay local está rodando ────────────────────────────
+async function checkRelay() {
+  setBadge('checking', '⏳ Verificando relay local...');
+  addLog('Verificando ws://localhost:8902/ping...', 'info');
+
+  return new Promise((resolve) => {
+    try {
+      const ws = new WebSocket(RELAY_PING);
+      const timer = setTimeout(() => {
+        ws.close();
+        relayAtivo = false;
+        setBadge('vps', '🔵 IP Cloud (VPS) — relay não detectado');
+        addLog('Relay não respondeu → usando VPS', 'info');
+        document.getElementById('routeSpan').textContent = 'VPS (IP do servidor)';
+        resolve(false);
+      }, 2000);
+
+      ws.onmessage = (e) => {
+        clearTimeout(timer);
+        const data = JSON.parse(e.data);
+        if (data.status === 'ok') {
+          relayAtivo = true;
+          setBadge('connected', `🟢 IP Local (residencial) — Relay v${data.version} ativo`);
+          addLog(`Relay detectado! v${data.version} rodando na porta ${RELAY_PORT}`, '');
+          document.getElementById('routeSpan').textContent = 'Relay Local (IP residencial)';
+          ws.close();
+          resolve(true);
+        }
+      };
+
+      ws.onerror = () => {
+        clearTimeout(timer);
+        relayAtivo = false;
+        setBadge('vps', '🔵 IP Cloud (VPS) — relay não instalado');
+        addLog('Relay não encontrado → usando VPS', 'info');
+        document.getElementById('routeSpan').textContent = 'VPS (IP do servidor)';
+        resolve(false);
+      };
+    } catch(e) {
+      relayAtivo = false;
+      setBadge('vps', '🔵 IP Cloud (VPS)');
+      resolve(false);
+    }
+  });
+}
+
+function setBadge(tipo, texto) {
+  const badge = document.getElementById('relayBadge');
+  const dot   = document.getElementById('relayDot');
+  const label = document.getElementById('relayLabel');
+  badge.className = `relay-badge ${tipo}`;
+  dot.className   = `dot ${tipo === 'connected' ? 'green' : tipo === 'vps' ? 'blue' : 'gray'}`;
+  if (tipo === 'connected') dot.classList.add('pulse');
+  label.textContent = texto;
+}
+
+// ── Iniciar stream ─────────────────────────────────────────────────────
+async function iniciarStream() {
+  const url = document.getElementById('iUrl').value.trim();
+  const key = document.getElementById('iKey').value.trim();
+  if (!url || !key) { addLog('Preencha URL e Chave RTMP', 'err'); return; }
+  const rtmpFull = url.endsWith('/') ? url + key : url + '/' + key;
+
+  document.getElementById('btnStart').disabled = true;
+
+  // Cria um canvas de teste (720x1280, fundo preto com texto)
+  const canvas = document.createElement('canvas');
+  canvas.width = 720; canvas.height = 1280;
+  const ctx = canvas.getContext('2d');
+  function drawTest() {
+    ctx.fillStyle = '#0f1923';
+    ctx.fillRect(0, 0, 720, 1280);
+    ctx.fillStyle = '#22c55e';
+    ctx.font = 'bold 48px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('BlackLive Relay', 360, 580);
+    ctx.font = '28px sans-serif';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('IP ' + (relayAtivo ? 'Residencial ✅' : 'VPS ☁️'), 360, 640);
+    ctx.fillStyle = '#64748b';
+    ctx.font = '22px monospace';
+    ctx.fillText(new Date().toLocaleTimeString(), 360, 700);
+    requestAnimationFrame(drawTest);
+  }
+  drawTest();
+
+  const videoStream = canvas.captureStream(30);
+  const audioCtx   = new AudioContext();
+  const dest        = audioCtx.createMediaStreamDestination();
+  const osc         = audioCtx.createOscillator();
+  const gain        = audioCtx.createGain();
+  osc.frequency.value = 440; gain.gain.value = 0.001; // silencioso
+  osc.connect(gain); gain.connect(dest); osc.start();
+
+  const finalStream = new MediaStream([
+    ...videoStream.getVideoTracks(),
+    ...dest.stream.getAudioTracks()
+  ]);
+
+  // Decide qual WebSocket usar
+  let wsUrl;
+  if (relayAtivo) {
+    wsUrl = `ws://localhost:${RELAY_PORT}/rtmp?rtmp=${encodeURIComponent(rtmpFull)}`;
+    addLog('Conectando ao relay local...');
+  } else {
+    // Fallback VPS (só mostra o endereço, não conecta de verdade sem o servidor)
+    wsUrl = `wss://${window.location.hostname}/ws?rtmp=${encodeURIComponent(rtmpFull)}`;
+    addLog('⚠️ Relay não ativo — stream iria para VPS: ' + wsUrl, 'info');
+  }
+
+  const ws = relayAtivo ? new WebSocket(wsUrl) : null;
+  if (!ws) {
+    addLog('(Teste sem relay: simulando conexão VPS)', 'info');
+    document.getElementById('btnStart').disabled = false;
+    return;
+  }
+
+  ws.onopen = () => {
+    addLog('✅ WebSocket aberto!');
+    streaming = true;
+    document.getElementById('btnStart').style.display = 'none';
+    document.getElementById('btnStop').style.display  = 'block';
+
+    recorder = new MediaRecorder(finalStream, {
+      mimeType: 'video/webm; codecs=vp8,opus',
+      videoBitsPerSecond: 2500000
+    });
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+        ws.send(e.data);
+        addLog(`📦 Chunk enviado: ${(e.data.size/1024).toFixed(1)} KB`, 'info');
+      }
+    };
+    recorder.start(1000);
+    addLog('🔴 Gravando e enviando para FFmpeg local...');
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      addLog('Relay: ' + JSON.stringify(d));
+    } catch {}
+  };
+
+  ws.onerror = (e) => {
+    addLog('❌ Erro WebSocket', 'err');
+    document.getElementById('btnStart').disabled = false;
+  };
+
+  ws.onclose = () => {
+    addLog('WebSocket fechado', 'info');
+    if (streaming) pararStream();
+  };
+
+  wsRelay = ws;
+}
+
+// ── Parar stream ──────────────────────────────────────────────────────
+function pararStream() {
+  streaming = false;
+  if (recorder && recorder.state !== 'inactive') recorder.stop();
+  if (wsRelay)  { wsRelay.close(); wsRelay = null; }
+  document.getElementById('btnStart').style.display = 'block';
+  document.getElementById('btnStart').disabled = false;
+  document.getElementById('btnStop').style.display  = 'none';
+  addLog('⏹ Stream parado', 'info');
+}
+
+// ── Auto check ao carregar ────────────────────────────────────────────
+window.addEventListener('load', () => {
+  checkRelay();
+});
+</script>
+</body>
+</html>
