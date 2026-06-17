@@ -49,6 +49,10 @@ def build():
     datas = get_ffmpeg_data()
     if os.path.exists(ICON_PNG):
         datas.append((ICON_PNG, '.'))
+        
+    # Adiciona o runtime do PyArmor se existir
+    if os.path.exists('pyarmor_runtime_000000'):
+        datas.append(('pyarmor_runtime_000000', 'pyarmor_runtime_000000'))
 
     # Monta os argumentos do PyInstaller
     args = [
