@@ -27,6 +27,12 @@ PORT    = 8902
 VERSION = "1.2.0"
 VPS_URL = "https://fabricalive.johne.tech"
 
+ALLOWED_ORIGINS = {
+    "https://fabricalive.johne.tech",
+    "http://localhost:8900",
+    "http://127.0.0.1:8900",
+}
+
 # ── FFmpeg bundled via imageio_ffmpeg ─────────────────────────────────────────
 def get_ffmpeg():
     """Retorna o path do FFmpeg bundled. Fallback para o do sistema."""
@@ -79,6 +85,16 @@ def check_update():
 
 # ── Handler principal WebSocket ────────────────────────────────────────────────
 async def handle(websocket):
+    try:
+        origin = websocket.request.headers.get("Origin", "")
+    except Exception:
+        origin = ""
+
+    if origin not in ALLOWED_ORIGINS:
+        log.warning(f"Conexao recusada — origem nao autorizada: {origin!r}")
+        await websocket.close(1008, "Unauthorized")
+        return
+
     try:
         path = websocket.request.path
     except AttributeError:

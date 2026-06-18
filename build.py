@@ -41,13 +41,56 @@ def get_ffmpeg_data():
         print('  ⚠️  imageio-ffmpeg não instalado. Instale: pip install imageio-ffmpeg')
         return []
 
+def obfuscate():
+    """Obfusca os arquivos com PyArmor antes de empacotar."""
+    obf_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'obfuscated')
+    if os.path.exists(obf_dir):
+        shutil.rmtree(obf_dir)
+
+    candidates = [
+        shutil.which('pyarmor'),
+        os.path.expanduser('~/Library/Python/3.9/bin/pyarmor'),
+        os.path.expanduser('~/Library/Python/3.10/bin/pyarmor'),
+        os.path.expanduser('~/.local/bin/pyarmor'),
+    ]
+    pyarmor = next((p for p in candidates if p and os.path.isfile(p)), None)
+    if not pyarmor:
+        print('   PyArmor nao encontrado — buildando sem obfuscacao')
+        return None
+
+    result = subprocess.run(
+        [pyarmor, 'gen', '--output', obf_dir, 'relay_tray.py', 'local_relay.py'],
+        cwd=os.path.dirname(os.path.abspath(__file__))
+    )
+    if result.returncode != 0:
+        print('❌ PyArmor falhou — buildando sem obfuscação')
+        return None
+    print('   Obfuscação concluída')
+    return obf_dir
+
+
 def build():
     print(f'\n🔨 Construindo {NOME} v{VERSAO}...')
     print(f'   Plataforma: {sys.platform}\n')
 
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Obfusca o código
+    obf_dir = obfuscate()
+
     datas = get_ffmpeg_data()
     if os.path.exists(ICON_PNG):
         datas.append((ICON_PNG, '.'))
+
+    # Inclui o runtime do PyArmor no bundle
+    if obf_dir:
+        runtime_dirs = [d for d in os.listdir(obf_dir) if d.startswith('pyarmor_runtime')]
+        for rd in runtime_dirs:
+            datas.append((os.path.join(obf_dir, rd), rd))
+
+    # Usa os arquivos obfuscados como source
+    work_dir = obf_dir if obf_dir else base_dir
+    entry    = os.path.join(work_dir, ENTRY_POINT)
 
     args = [
         sys.executable, '-m', 'PyInstaller',
@@ -68,22 +111,25 @@ def build():
     for src, dst in datas:
         args.append(f'--add-data={src}{os.pathsep}{dst}')
 
-    if sys.platform == 'win32' and os.path.exists(ICON_WIN):
-        args.append(f'--icon={ICON_WIN}')
-    elif sys.platform == 'darwin' and os.path.exists(ICON_MAC):
-        args.append(f'--icon={ICON_MAC}')
-    elif os.path.exists(ICON_PNG):
-        args.append(f'--icon={ICON_PNG}')
+    if sys.platform == 'win32' and os.path.exists(os.path.join(base_dir, ICON_WIN)):
+        args.append(f'--icon={os.path.join(base_dir, ICON_WIN)}')
+    elif sys.platform == 'darwin' and os.path.exists(os.path.join(base_dir, ICON_MAC)):
+        args.append(f'--icon={os.path.join(base_dir, ICON_MAC)}')
+    elif os.path.exists(os.path.join(base_dir, ICON_PNG)):
+        args.append(f'--icon={os.path.join(base_dir, ICON_PNG)}')
 
-    args.append(ENTRY_POINT)
+    args.append(entry)
 
     print('   Executando PyInstaller...')
-    result = subprocess.run(args, cwd=os.path.dirname(os.path.abspath(__file__)))
+    result = subprocess.run(args, cwd=base_dir)
 
     if result.returncode == 0:
         dist_path = os.path.join('dist', NOME)
         if sys.platform == 'darwin':
             app_path = os.path.join('dist', f'{NOME}.app')
+            # Remove quarantine para evitar "app danificado" no Mac
+            subprocess.run(['xattr', '-cr', app_path], capture_output=True)
+            subprocess.run(['codesign', '--force', '--deep', '--sign', '-', app_path], capture_output=True)
             print(f'\n✅ Mac app gerado: {os.path.abspath(app_path)}')
         elif sys.platform == 'win32':
             dist_path += '.exe'
