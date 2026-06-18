@@ -14,8 +14,8 @@ import sys
 import subprocess
 import shutil
 
-NOME        = 'BlackLive-Relay'
-VERSAO      = '1.0.0'
+NOME        = 'Black Live'
+VERSAO      = '1.2.0'
 ENTRY_POINT = 'relay_tray.py'
 ICON_WIN    = 'icon.ico'
 ICON_MAC    = 'icon.icns'
@@ -27,7 +27,7 @@ def clean():
             shutil.rmtree(folder)
             print(f'  🗑️  {folder}/ removido')
     for f in os.listdir('.'):
-        if f.endswith('.spec') and f != 'relay.spec':
+        if f.endswith('.spec'):
             os.remove(f)
 
 def get_ffmpeg_data():
@@ -45,20 +45,14 @@ def build():
     print(f'\n🔨 Construindo {NOME} v{VERSAO}...')
     print(f'   Plataforma: {sys.platform}\n')
 
-    # Dados adicionais (FFmpeg + ícone)
     datas = get_ffmpeg_data()
     if os.path.exists(ICON_PNG):
         datas.append((ICON_PNG, '.'))
-        
-    # Adiciona o runtime do PyArmor se existir
-    if os.path.exists('pyarmor_runtime_000000'):
-        datas.append(('pyarmor_runtime_000000', 'pyarmor_runtime_000000'))
 
-    # Monta os argumentos do PyInstaller
     args = [
         sys.executable, '-m', 'PyInstaller',
         '--onefile',
-        '--noconsole',          # sem janela de terminal
+        '--noconsole',
         '--clean',
         f'--name={NOME}',
         '--hidden-import=imageio_ffmpeg',
@@ -70,11 +64,9 @@ def build():
         '--hidden-import=tkinter',
     ]
 
-    # Adiciona datas (FFmpeg, ícone)
     for src, dst in datas:
         args.append(f'--add-data={src}{os.pathsep}{dst}')
 
-    # Ícone do executável
     if sys.platform == 'win32' and os.path.exists(ICON_WIN):
         args.append(f'--icon={ICON_WIN}')
     elif sys.platform == 'darwin' and os.path.exists(ICON_MAC):
@@ -89,33 +81,33 @@ def build():
 
     if result.returncode == 0:
         dist_path = os.path.join('dist', NOME)
-        if sys.platform == 'win32':
+        if sys.platform == 'darwin':
+            app_path = os.path.join('dist', f'{NOME}.app')
+            print(f'\n✅ Mac app gerado: {os.path.abspath(app_path)}')
+        elif sys.platform == 'win32':
             dist_path += '.exe'
-        print(f'\n✅ Executável gerado: {os.path.abspath(dist_path)}')
-        print(f'   Tamanho: {os.path.getsize(dist_path) // 1024 // 1024} MB')
+            print(f'\n✅ Windows exe gerado: {os.path.abspath(dist_path)}')
+            print(f'   Tamanho: {os.path.getsize(dist_path) // 1024 // 1024} MB')
     else:
         print('\n❌ Falha ao gerar executável. Verifique os logs acima.')
         sys.exit(1)
 
 def check_deps():
-    """Verifica se as dependências estão instaladas."""
     try:
         import PyInstaller
         import websockets
         import imageio_ffmpeg
         import pystray
         import PIL
+        print('✅ Todas as dependências instaladas')
     except ImportError as e:
-        print(f'⚠️  Dependências faltando: {e}')
+        print(f'⚠️  Dependência faltando: {e}')
         print('   Instale: pip install pyinstaller websockets imageio-ffmpeg pystray Pillow')
         sys.exit(1)
-    print('✅ Todas as dependências instaladas')
 
 if __name__ == '__main__':
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
     if '--clean' in sys.argv:
         clean()
-
     check_deps()
     build()
