@@ -62,6 +62,7 @@ def build():
         '--hidden-import=PIL.Image',
         '--hidden-import=PIL.ImageDraw',
         '--hidden-import=tkinter',
+        '--hidden-import=local_relay',
     ]
 
     for src, dst in datas:

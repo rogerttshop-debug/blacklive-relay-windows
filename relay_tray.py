@@ -8,6 +8,7 @@ Inicia o local_relay.py em background e oferece menu de controle.
 
 import sys
 import os
+import asyncio
 import subprocess
 import threading
 import time
@@ -15,47 +16,46 @@ import json
 import urllib.request
 import urllib.error
 
-# Resolve o diretório do executável (funciona tanto .py quanto PyInstaller)
-if getattr(sys, "frozen", False):
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-RELAY_SCRIPT = os.path.join(BASE_DIR, "local_relay.py")
 VPS_URL      = "https://fabricalive.johne.tech"
 PORT         = 8902
 
-relay_proc = None
-tray_icon  = None
+relay_thread = None
+relay_loop   = None
+tray_icon    = None
 
 
 # ── Controle do relay ──────────────────────────────────────────────────────────
 def relay_running():
-    return relay_proc is not None and relay_proc.poll() is None
+    return relay_thread is not None and relay_thread.is_alive()
+
+
+def _run_relay():
+    global relay_loop
+    import local_relay
+    relay_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(relay_loop)
+    try:
+        relay_loop.run_until_complete(local_relay.main())
+    except Exception:
+        pass
+    finally:
+        relay_loop.close()
+        relay_loop = None
 
 
 def start_relay():
-    global relay_proc
+    global relay_thread
     if relay_running():
         return
-    relay_proc = subprocess.Popen(
-        [sys.executable, RELAY_SCRIPT],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        cwd=BASE_DIR
-    )
+    relay_thread = threading.Thread(target=_run_relay, daemon=True, name="relay")
+    relay_thread.start()
 
 
 def stop_relay():
-    global relay_proc
-    if relay_proc:
-        try:
-            relay_proc.terminate()
-            relay_proc.wait(timeout=3)
-        except Exception:
-            try: relay_proc.kill()
-            except: pass
-    relay_proc = None
+    global relay_loop, relay_thread
+    if relay_loop and not relay_loop.is_closed():
+        relay_loop.call_soon_threadsafe(relay_loop.stop)
+    relay_thread = None
 
 
 def ping_relay():
@@ -137,16 +137,10 @@ def watchdog():
 def main():
     global tray_icon
 
-    try:
-        import pystray
-        from PIL import Image
-    except ImportError:
-        print("Instalando dependências...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "pystray", "pillow"], check=True)
-        import pystray
-        from PIL import Image
+    import pystray
+    from PIL import Image
 
-    # Inicia o relay imediatamente
+    # Inicia o relay imediatamente (em thread, sem subprocess)
     start_relay()
 
     # Watchdog em background
