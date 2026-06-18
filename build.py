@@ -14,7 +14,7 @@ import sys
 import subprocess
 import shutil
 
-NOME        = 'Black Live'
+NOME        = 'BlackLive-Relay' if sys.platform == 'win32' else 'Black Live'
 VERSAO      = '1.2.0'
 ENTRY_POINT = 'relay_tray.py'
 ICON_WIN    = 'icon.ico'
