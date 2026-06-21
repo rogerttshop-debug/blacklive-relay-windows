@@ -1,6 +1,0 @@
-websockets>=12.0
-imageio-ffmpeg>=0.5.1
-pystray>=0.19.5
-Pillow>=10.0.0
-pyinstaller>=6.0.0
-pyarmor>=8.0
