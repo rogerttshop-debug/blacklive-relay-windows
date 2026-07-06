@@ -106,6 +106,16 @@ def build():
         '--hidden-import=PIL.ImageDraw',
         '--hidden-import=tkinter',
         '--hidden-import=local_relay',
+        '--hidden-import=json',
+        '--hidden-import=json.decoder',
+        '--hidden-import=json.encoder',
+        '--hidden-import=urllib',
+        '--hidden-import=urllib.request',
+        '--hidden-import=urllib.parse',
+        '--hidden-import=ssl',
+        '--hidden-import=socket',
+        '--hidden-import=threading',
+        '--hidden-import=subprocess',
     ]
 
     for src, dst in datas:
