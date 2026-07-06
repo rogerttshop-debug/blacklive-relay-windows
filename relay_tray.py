@@ -115,11 +115,16 @@ def show_notification(msg):
 # ── Ícone gerado programaticamente (sem arquivo externo) ──────────────────────
 def create_icon_image():
     try:
-        from PIL import Image, ImageDraw
+        from PIL import Image
+        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        icon_path = os.path.join(base, 'icon.png')
+        if os.path.exists(icon_path):
+            return Image.open(icon_path).convert('RGBA')
+        from PIL import ImageDraw
         img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        draw.ellipse([4, 4, 60, 60], fill=(220, 38, 38, 255))   # vermelho
-        draw.polygon([(22, 16), (22, 48), (50, 32)], fill=(255, 255, 255, 255))  # play
+        draw.ellipse([4, 4, 60, 60], fill=(220, 38, 38, 255))
+        draw.polygon([(22, 16), (22, 48), (50, 32)], fill=(255, 255, 255, 255))
         return img
     except Exception:
         return None
