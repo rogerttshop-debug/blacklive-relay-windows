@@ -18,13 +18,14 @@ import sys
 import os
 import json
 import signal
+import time
 import urllib.parse
 import urllib.request
 import logging
 import threading
 
 PORT    = 8902
-VERSION = "1.3.0-copy"
+VERSION = "1.6.1"
 VPS_URL = "https://blacklive.com.br"
 
 ALLOWED_ORIGINS = {
@@ -61,7 +62,7 @@ log = logging.getLogger("relay")
 # ── Auto-update ────────────────────────────────────────────────────────────────
 def check_update():
     """Auto-update desativado — versão de teste com c:v copy."""
-    log.info("Relay TESTE v1.3.0-copy — auto-update desativado")
+    log.info(f"Relay v{VERSION} — auto-update desativado (binario nao se auto-atualiza)")
     return
     try:
         url = f"{VPS_URL}/local_relay.py"
@@ -115,7 +116,10 @@ async def handle(websocket):
             "status": "ok",
             "version": VERSION,
             "ffmpeg": FFMPEG,
-            "ip": "local"
+            "ip": "local",
+            "modo_leve": {"armado": bool(MODO_LEVE["video"]),
+                          "no_ar": MODO_LEVE["ativo"],
+                          "encoder": MODO_LEVE["encoder"]}
         }))
         return
 
@@ -136,6 +140,12 @@ async def handle(websocket):
 async def _handle_rtmp(websocket, qs):
     rtmp_url  = qs["rtmp"][0]
     proxy_url = qs.get("proxy", [None])[0]
+
+    # [LEVE] navegador vai transmitir: se o modo leve estiver no ar, sai de cena
+    # (dois pushers na mesma chave brigam)
+    if MODO_LEVE["ativo"]:
+        log.info("[LEVE] navegador reassumiu — parando o push leve")
+        leve_parar_push()
 
     log.info(f"Relay ao vivo → {rtmp_url.split('?')[0]}...")
 
@@ -160,33 +170,65 @@ async def _handle_rtmp(websocket, qs):
         "-f", "flv", rtmp_url
     ]
 
+    # v1.6.1: escrita via FILA + thread (nunca trava o relay). Se o ffmpeg ENTALA
+    # (vivo mas surdo), a fila enche em ~20s -> mata e fecha a conexao NA HORA.
+    # Antes, o relay travava junto e o navegador acumulava ~20MB/min de memoria
+    # ate estourar (comprovado 28/08 — caso juliana "Out of Memory de madrugada").
+    import queue as _q
+    fila = _q.Queue(maxsize=20)   # ~20s de video; ~6MB no pior caso
+
+    def _writer(p, f):
+        while True:
+            item = f.get()
+            if item is None:
+                break
+            try:
+                p.stdin.write(item)
+                p.stdin.flush()
+            except Exception:
+                break   # pipe fechado/quebrado: o loop principal percebe pelo poll()
+
     try:
         proc = subprocess.Popen(
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
             stdout=open(ffmpeg_log, "w"),
             stderr=open(ffmpeg_log, "a"),
-            env=env
+            env=env,
+            creationflags=_sub_flags()   # Windows: sem janela preta
         )
+        threading.Thread(target=_writer, args=(proc, fila), daemon=True).start()
         log.info("FFmpeg iniciado (local → TikTok)")
         await websocket.send(json.dumps({"status": "streaming", "ip": "local"}))
 
         async for msg in websocket:
             if isinstance(msg, bytes):
+                if proc.poll() is not None:
+                    log.warning("FFmpeg morreu — fechando a conexao p/ o painel religar")
+                    break
                 try:
-                    proc.stdin.write(msg)
-                    proc.stdin.flush()
-                except BrokenPipeError:
-                    log.warning("FFmpeg encerrou o pipe")
+                    fila.put_nowait(msg)
+                except _q.Full:
+                    log.warning("FFmpeg ENTALADO (fila cheia ~20s) — matando e fechando p/ religar")
+                    try: proc.kill()
+                    except Exception: pass
                     break
     except Exception as e:
         log.error(f"Erro no relay: {e}")
     finally:
+        try: proc.kill()          # kill primeiro: desbloqueia o writer se estiver preso
+        except: pass
+        try: fila.put_nowait(None)
+        except Exception: pass
         try: proc.stdin.close()
         except: pass
-        try: proc.terminate()
-        except: pass
         log.info("Relay encerrado")
+        # [LEVE] navegador soltou a live (PARAR): se ha video armado, o relay assume
+        try:
+            if MODO_LEVE["video"] and leve_iniciar(rtmp_url):
+                log.info("[LEVE] assumindo a live na mesma chave")
+        except Exception as _e:
+            log.warning(f"[LEVE] falha ao assumir: {_e}")
 
 
 # ── Render local: camadas → MP4 → upload VPS → VPS transmite ─────────────────
@@ -425,7 +467,225 @@ async def _handle_render(websocket):
         except: pass
 
 
+# ═══ MODO LEVE (v1.6) ═════════════════════════════════════════════════════════
+# O relay toca o MP4 LOCAL com encoder de HARDWARE e empurra direto pro TikTok.
+# O navegador sai do caminho: sem canvas, sem MediaRecorder — pode ate fechar.
+# Fluxo: usuario escolhe o video (menu da bandeja) -> transmite normal 1x pelo
+# painel (o relay ve a chave RTMP) -> clica PARAR -> o relay ASSUME na mesma
+# chave, com religa automatico e anti-suspensao. Provado 27-28/08 no Mac:
+# 4-12% de 1 nucleo vs ~93% do navegador.
+
+MODO_LEVE = {"video": None, "proc": None, "rtmp": None, "stop": False,
+             "encoder": None, "mortes_rapidas": 0, "caff": None, "gen": 0,
+             "ativo": False}
+NOTIFY = [None]   # relay_tray injeta show_notification aqui
+
+def _notify(msg):
+    try:
+        if NOTIFY[0]:
+            NOTIFY[0](msg)
+    except Exception:
+        pass
+    log.info(f"[LEVE] {msg}")
+
+def _sub_flags():
+    """No Windows, esconde a janela preta dos subprocessos."""
+    return 0x08000000 if sys.platform.startswith("win") else 0
+
+def leve_detectar_encoder():
+    """Testa os encoders de hardware da maquina (1s sintetico). Cacheia o vencedor."""
+    if MODO_LEVE["encoder"]:
+        return MODO_LEVE["encoder"]
+    if sys.platform == "darwin":
+        candidatos = ["h264_videotoolbox"]
+    elif sys.platform.startswith("win"):
+        candidatos = ["h264_nvenc", "h264_qsv", "h264_amf"]
+    else:
+        candidatos = []
+    escolhido = "libx264"   # fallback por software (sempre existe)
+    for enc in candidatos:
+        try:
+            r = subprocess.run(
+                [FFMPEG, "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30",
+                 "-t", "1", "-c:v", enc, "-f", "null", "-"],
+                capture_output=True, timeout=25, creationflags=_sub_flags())
+            if r.returncode == 0:
+                escolhido = enc
+                break
+        except Exception:
+            pass
+    MODO_LEVE["encoder"] = escolhido
+    log.info(f"[LEVE] encoder detectado: {escolhido}")
+    return escolhido
+
+def _leve_tem_audio(video):
+    try:
+        r = subprocess.run([FFMPEG, "-hide_banner", "-i", video],
+                           capture_output=True, timeout=20, creationflags=_sub_flags())
+        return b"Audio:" in r.stderr
+    except Exception:
+        return True   # na duvida assume que tem (ffmpeg reclama se nao tiver mapa)
+
+def _leve_cmd(rtmp_url):
+    enc   = leve_detectar_encoder()
+    video = MODO_LEVE["video"]
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "warning"]
+    if enc == "h264_videotoolbox":
+        cmd += ["-hwaccel", "videotoolbox"]
+    cmd += ["-stream_loop", "-1", "-re", "-fflags", "+genpts", "-i", video]
+    if _leve_tem_audio(video):
+        cmd += ["-map", "0:v:0", "-map", "0:a:0"]
+    else:
+        cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-map", "0:v:0", "-map", "1:a:0"]
+    if enc == "libx264":
+        # sem hardware: reduz p/ 720 de largura pra aliviar a CPU
+        cmd += ["-vf", "scale=720:-2", "-c:v", "libx264", "-preset", "veryfast"]
+    else:
+        cmd += ["-c:v", enc]
+        if enc == "h264_nvenc":
+            cmd += ["-preset", "p4"]
+    cmd += ["-b:v", "2500k", "-maxrate", "2500k", "-bufsize", "5000k", "-g", "60",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-user_agent", "TikTokLiveStudio/0.46.1",
+            "-metadata", "title=TikTok Live Studio",
+            "-metadata", "encoder=TikTok Live Studio 0.46.1",
+            "-f", "flv", rtmp_url]
+    return cmd
+
+def _leve_anti_sleep(on):
+    """Impede o PC de dormir durante a transmissao leve."""
+    try:
+        if sys.platform == "darwin":
+            if on and not MODO_LEVE["caff"]:
+                MODO_LEVE["caff"] = subprocess.Popen(["caffeinate", "-s"])
+            elif not on and MODO_LEVE["caff"]:
+                MODO_LEVE["caff"].terminate()
+                MODO_LEVE["caff"] = None
+        elif sys.platform.startswith("win"):
+            import ctypes
+            ES_CONTINUOUS, ES_SYSTEM = 0x80000000, 0x00000001
+            ctypes.windll.kernel32.SetThreadExecutionState(
+                (ES_CONTINUOUS | ES_SYSTEM) if on else ES_CONTINUOUS)
+    except Exception:
+        pass
+
+def _leve_push_loop(gen):
+    rtmp_url = MODO_LEVE["rtmp"]
+    lelog = os.path.join(os.path.expanduser("~"), ".blacklive_leve.log")
+    time.sleep(3)   # da tempo do PARAR assentar no TikTok
+    _leve_anti_sleep(True)
+    MODO_LEVE["ativo"] = True
+    try:
+        while not MODO_LEVE["stop"] and MODO_LEVE["gen"] == gen:
+            t0 = time.time()
+            try:
+                proc = subprocess.Popen(_leve_cmd(rtmp_url),
+                                        stdout=open(lelog, "a"),
+                                        stderr=subprocess.STDOUT,
+                                        creationflags=_sub_flags())
+            except Exception as e:
+                log.error(f"[LEVE] falha ao iniciar ffmpeg: {e}")
+                _notify("❌ Modo Leve: erro ao iniciar (veja .blacklive_leve.log)")
+                break
+            MODO_LEVE["proc"] = proc
+            _notify(f"🚀 Modo Leve NO AR ({MODO_LEVE['encoder']}) — pode ate fechar o navegador")
+            proc.wait()
+            MODO_LEVE["proc"] = None
+            if MODO_LEVE["stop"] or MODO_LEVE["gen"] != gen:
+                break
+            rodou = time.time() - t0
+            if rodou < 20:
+                MODO_LEVE["mortes_rapidas"] += 1
+                if MODO_LEVE["mortes_rapidas"] >= 5:
+                    log.error("[LEVE] 5 mortes rapidas — desistindo (live encerrada no TikTok?)")
+                    _notify("❌ Modo Leve: TikTok recusou a chave — transmita de novo pelo painel e clique PARAR")
+                    break
+            else:
+                MODO_LEVE["mortes_rapidas"] = 0
+            log.warning(f"[LEVE] ffmpeg caiu apos {int(rodou)}s — religando em 5s")
+            _notify("🔄 Modo Leve: religando a live...")
+            time.sleep(5)
+    finally:
+        MODO_LEVE["proc"] = None
+        MODO_LEVE["ativo"] = False
+        _leve_anti_sleep(False)
+        log.info("[LEVE] loop encerrado")
+
+def leve_iniciar(rtmp_url):
+    """Chamado quando o navegador SOLTA a live (PARAR) e ha video escolhido."""
+    if not (MODO_LEVE["video"] and os.path.isfile(MODO_LEVE["video"])):
+        return False
+    leve_parar_push()
+    MODO_LEVE["gen"] += 1
+    MODO_LEVE["rtmp"] = rtmp_url
+    MODO_LEVE["stop"] = False
+    MODO_LEVE["mortes_rapidas"] = 0
+    threading.Thread(target=_leve_push_loop, args=(MODO_LEVE["gen"],),
+                     daemon=True, name="leve").start()
+    return True
+
+def leve_parar_push():
+    """Para o push leve (mantem o video escolhido)."""
+    MODO_LEVE["stop"] = True
+    MODO_LEVE["gen"] += 1
+    p = MODO_LEVE["proc"]
+    if p:
+        try: p.terminate()
+        except Exception: pass
+
+def leve_desligar():
+    """Desliga o modo leve por completo (para o push e esquece o video)."""
+    leve_parar_push()
+    MODO_LEVE["video"] = None
+
+def leve_escolher_video():
+    """Dialogo de escolha do video (osascript no Mac, tkinter no Windows)."""
+    path = None
+    try:
+        if sys.platform == "darwin":
+            r = subprocess.run(
+                ["osascript", "-e",
+                 'POSIX path of (choose file with prompt "Escolha o vídeo da live:" of type {"public.movie"})'],
+                capture_output=True, text=True, timeout=180)
+            path = (r.stdout or "").strip() or None
+        else:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk(); root.withdraw()
+            try: root.attributes("-topmost", True)
+            except Exception: pass
+            path = filedialog.askopenfilename(
+                title="Escolha o vídeo da live",
+                filetypes=[("Vídeos", "*.mp4 *.mov *.mkv *.avi"), ("Todos", "*.*")]) or None
+            root.destroy()
+    except Exception as e:
+        log.warning(f"[LEVE] escolher video falhou: {e}")
+    if path and os.path.isfile(path):
+        MODO_LEVE["video"] = path
+        threading.Thread(target=leve_detectar_encoder, daemon=True).start()
+        log.info(f"[LEVE] video armado: {path}")
+        return path
+    return None
+
+
 # ── Servidor WebSocket ─────────────────────────────────────────────────────────
+async def handle_safe(websocket):
+    """Blindagem: qualquer erro numa conexao fica ISOLADO e nao derruba o servidor."""
+    try:
+        await handle(websocket)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning(f"Conexao encerrada com erro (isolada): {type(e).__name__}: {e}")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 async def main():
     try:
         import websockets
@@ -438,16 +698,57 @@ async def main():
     # Auto-update em background — não bloqueia o start
     threading.Thread(target=check_update, daemon=True).start()
 
-    async with websockets.serve(
-        handle,
-        "localhost",
-        PORT,
-        max_size=100 * 1024 * 1024,
-        ping_interval=20,
-        ping_timeout=60,
-    ):
-        print(f"✅ BlackLive Relay v{VERSION} em ws://localhost:{PORT}")
-        await asyncio.Future()
+    while True:
+        try:
+            async with websockets.serve(
+                handle_safe,
+                "127.0.0.1",
+                PORT,
+                max_size=100 * 1024 * 1024,
+                ping_interval=20,
+                ping_timeout=60,
+            ):
+                MODO_LEVE["_port_retry"] = 0   # subiu: zera o contador de porta presa
+                print(f"✅ BlackLive Relay v{VERSION} em ws://127.0.0.1:{PORT}")
+                await asyncio.Future()
+        except asyncio.CancelledError:
+            raise
+        except OSError as e:
+            # Porta ocupada. Duas causas (caso juliana 28/08, "abre e ja fecha"):
+            #  (a) OUTRO Black Live saudavel ja aberto -> avisa e sai (nao pode ter 2);
+            #  (b) socket morto/preso (ex: PC voltou do sono, instancia mal-fechada) ->
+            #      espera e tenta de novo ate 6x em vez de fechar na cara do usuario.
+            vivo = False
+            try:
+                import websockets as _ws
+                _hdr = {"Origin": "http://127.0.0.1:8900"}   # origem autorizada p/ passar no filtro
+                try:
+                    _conn = _ws.connect(f"ws://127.0.0.1:{PORT}/ping", open_timeout=3, additional_headers=_hdr)
+                except TypeError:   # versoes antigas do websockets usam outro nome
+                    _conn = _ws.connect(f"ws://127.0.0.1:{PORT}/ping", open_timeout=3, extra_headers=_hdr)
+                async with _conn as _w:
+                    json.loads(await _w.recv())
+                    vivo = True
+            except Exception:
+                vivo = False
+            if vivo:
+                log.error(f"Porta {PORT} ja tem um Black Live saudavel — este sai (evite abrir 2x).")
+                _notify("⚠️ O Black Live já está aberto — procure o ícone na bandeja")
+                os._exit(1)
+            _tent = MODO_LEVE.get("_port_retry", 0) + 1
+            MODO_LEVE["_port_retry"] = _tent
+            if _tent >= 6:
+                log.error(f"Porta {PORT} presa apos {_tent} tentativas ({e}). Encerrando.")
+                os._exit(1)
+            log.warning(f"Porta {PORT} ocupada sem relay vivo ({e}) — tentativa {_tent}/6, aguardando 5s...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            # Qualquer outra falha do servidor: loga e reergue em 2s (nao morre de vez).
+            log.error(f"Servidor WebSocket caiu ({type(e).__name__}: {e}). Reerguendo em 2s...")
+            try:
+                await asyncio.sleep(2)
+            except Exception:
+                pass
 
 
 # ── Auto-install Mac (LaunchAgent) ────────────────────────────────────────────
@@ -498,6 +799,14 @@ if __name__ == "__main__":
     if "--install-win" in sys.argv:
         install_win(); sys.exit(0)
 
+    # teste no terminal: `python3 local_relay.py /caminho/video.mp4` ja arma o modo leve
+    for _a in sys.argv[1:]:
+        if os.path.isfile(_a):
+            MODO_LEVE["video"] = _a
+            print(f"🎬 Modo Leve armado: {_a}\n   Transmita pelo painel e clique PARAR — o relay assume sozinho.")
+            threading.Thread(target=leve_detectar_encoder, daemon=True).start()
+            break
+
     def on_signal(*_):
         log.info("Relay encerrado por sinal")
         sys.exit(0)
@@ -508,3 +817,8 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nRelay encerrado.")
+    except SystemExit:
+        raise
+    except Exception as e:
+        log.error(f"Relay caiu de forma fatal ({type(e).__name__}: {e}). Encerrando o processo (sem deixar zumbi).")
+        os._exit(1)
