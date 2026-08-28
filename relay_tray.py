@@ -16,7 +16,7 @@ import json
 import urllib.request
 import urllib.error
 
-VPS_URL      = "https://fabricalive.johne.tech"
+VPS_URL      = "https://blacklive.com.br"
 PORT         = 8902
 
 relay_thread = None
@@ -32,6 +32,10 @@ def relay_running():
 def _run_relay():
     global relay_loop
     import local_relay
+    try:
+        local_relay.NOTIFY[0] = show_notification   # notificacoes do modo leve na bandeja
+    except Exception:
+        pass
     relay_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(relay_loop)
     try:
@@ -95,13 +99,52 @@ def build_menu(Icon, Menu, MenuItem):
         stop_relay()
         tray_icon.stop()
 
-    return Menu(
+    def on_leve_video(_):
+        def _escolher():
+            import local_relay
+            p = local_relay.leve_escolher_video()
+            if p:
+                show_notification("🎬 Modo Leve armado: %s — transmita pelo painel e clique PARAR" % os.path.basename(p))
+            else:
+                show_notification("Nenhum vídeo escolhido")
+        threading.Thread(target=_escolher, daemon=True).start()
+
+    def on_leve_status(_):
+        import local_relay
+        ml = local_relay.MODO_LEVE
+        if ml["ativo"]:
+            show_notification("🚀 Modo Leve NO AR (%s)" % (ml["encoder"] or "?"))
+        elif ml["video"]:
+            show_notification("🎬 Armado: %s — transmita e clique PARAR" % os.path.basename(ml["video"]))
+        else:
+            show_notification("Modo Leve desligado — escolha um vídeo no menu")
+
+    def on_leve_off(_):
+        import local_relay
+        local_relay.leve_desligar()
+        show_notification("⏹ Modo Leve desligado")
+
+    # v1.6.1 "estabilidade": menu do MODO LEVE desligado neste release (codigo fica
+    # dormente no local_relay.py; religamos o menu quando o modo leve for lancado)
+    MODO_LEVE_MENU = False
+    itens = [
         MenuItem("🟢 Abrir Painel", on_abrir_painel, default=True),
         MenuItem("📡 Verificar Status", on_status),
+    ]
+    if MODO_LEVE_MENU:
+        itens += [
+            Menu.SEPARATOR,
+            MenuItem("🎬 Modo Leve — escolher vídeo", on_leve_video),
+            MenuItem("📊 Modo Leve — status", on_leve_status),
+            MenuItem("⏹ Modo Leve — desligar", on_leve_off),
+        ]
+    itens += [
+        Menu.SEPARATOR,
         MenuItem("🔄 Reiniciar Relay", on_restart),
         Menu.SEPARATOR,
         MenuItem("❌ Encerrar", on_quit),
-    )
+    ]
+    return Menu(*itens)
 
 
 def show_notification(msg):
@@ -115,16 +158,11 @@ def show_notification(msg):
 # ── Ícone gerado programaticamente (sem arquivo externo) ──────────────────────
 def create_icon_image():
     try:
-        from PIL import Image
-        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-        icon_path = os.path.join(base, 'icon.png')
-        if os.path.exists(icon_path):
-            return Image.open(icon_path).convert('RGBA')
-        from PIL import ImageDraw
+        from PIL import Image, ImageDraw
         img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        draw.ellipse([4, 4, 60, 60], fill=(220, 38, 38, 255))
-        draw.polygon([(22, 16), (22, 48), (50, 32)], fill=(255, 255, 255, 255))
+        draw.ellipse([4, 4, 60, 60], fill=(220, 38, 38, 255))   # vermelho
+        draw.polygon([(22, 16), (22, 48), (50, 32)], fill=(255, 255, 255, 255))  # play
         return img
     except Exception:
         return None
