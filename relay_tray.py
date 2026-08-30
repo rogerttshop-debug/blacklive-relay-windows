@@ -126,7 +126,7 @@ def build_menu(Icon, Menu, MenuItem):
 
     # v1.6.1 "estabilidade": menu do MODO LEVE desligado neste release (codigo fica
     # dormente no local_relay.py; religamos o menu quando o modo leve for lancado)
-    MODO_LEVE_MENU = False
+    MODO_LEVE_MENU = False   # build cliente Windows: menu do modo leve OFF
     itens = [
         MenuItem("🟢 Abrir Painel", on_abrir_painel, default=True),
         MenuItem("📡 Verificar Status", on_status),

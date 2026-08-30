@@ -25,7 +25,7 @@ import logging
 import threading
 
 PORT    = 8902
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 VPS_URL = "https://blacklive.com.br"
 
 ALLOWED_ORIGINS = {
@@ -128,6 +128,29 @@ async def handle(websocket):
         await _handle_render(websocket)
         return
 
+    # /leve — controle do MODO LEVE pelo PAINEL (29/08): o botao fica na pagina,
+    # o relay abre o seletor de arquivo na maquina. Sem caçar icone de bandeja.
+    if parsed.path == "/leve":
+        try:
+            msg = await asyncio.wait_for(websocket.recv(), timeout=10)
+            cmd = json.loads(msg).get("cmd", "")
+        except Exception:
+            cmd = "status"
+        if cmd == "escolher":
+            loop = asyncio.get_event_loop()
+            path = await loop.run_in_executor(None, leve_escolher_video)
+            await websocket.send(json.dumps({"ok": bool(path),
+                "video": os.path.basename(path) if path else None}))
+        elif cmd == "desligar":
+            leve_desligar()
+            await websocket.send(json.dumps({"ok": True, "video": None}))
+        else:
+            await websocket.send(json.dumps({"ok": True,
+                "armado": bool(MODO_LEVE["video"]),
+                "video": os.path.basename(MODO_LEVE["video"]) if MODO_LEVE["video"] else None,
+                "no_ar": MODO_LEVE["ativo"], "encoder": MODO_LEVE["encoder"]}))
+        return
+
     # /rtmp — relay de stream ao vivo (câmera → TikTok)
     if "rtmp" not in qs:
         await websocket.send(json.dumps({"error": "rtmp param missing"}))
@@ -137,6 +160,52 @@ async def handle(websocket):
 
 
 # ── Relay ao vivo: WebM → FFmpeg → RTMP ───────────────────────────────────────
+def _build_tx_cmd(rtmp_url):
+    """Monta o comando ffmpeg da transmissao.
+    QUALIDADE (v1.6.2): se a maquina tem encoder de HARDWARE (placa de video), reencoda
+    com keyframe fixo de 2s + bitrate estavel (como o TikTok Live Studio) — custo ~5-10%.
+    PC FRACO (so software/libx264): cai automatico pro repasse -c:v copy de sempre (nao
+    reencoda p/ nao sufocar a CPU). Ninguem trava.
+    Desliga a qualidade criando o arquivo ~/.bl_relay_qualidade.off (volta pro copy)."""
+    base_meta = [
+        "-user_agent", "TikTokLiveStudio/0.46.1",
+        "-metadata", "title=TikTok Live Studio",
+        "-metadata", "encoder=TikTok Live Studio 0.46.1",
+    ]
+    off = os.path.join(os.path.expanduser("~"), ".bl_relay_qualidade.off")
+    enc = leve_detectar_encoder()
+    tem_hw = enc and enc != "libx264"
+    if tem_hw and not os.path.exists(off):
+        # QUALIDADE por hardware: 1080p (largura), keyframe 2s (30fps -> g=60), bitrate estavel
+        KBPS = 4500
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "warning",
+               "-fflags", "+genpts+discardcorrupt",
+               "-f", "webm", "-i", "pipe:0",
+               "-vf", "scale=1080:-2:flags=bicubic",
+               "-r", "30",
+               "-c:v", enc,
+               "-b:v", "%dk" % KBPS, "-maxrate", "%dk" % KBPS, "-bufsize", "%dk" % (KBPS * 2),
+               "-g", "60", "-keyint_min", "60",
+               "-pix_fmt", "yuv420p"]
+        if enc == "h264_videotoolbox":
+            cmd += ["-realtime", "1", "-profile:v", "high"]
+        elif enc == "h264_nvenc":
+            cmd += ["-rc", "cbr", "-preset", "p4", "-tune", "ll", "-profile:v", "high"]
+        elif enc == "h264_qsv":
+            cmd += ["-profile:v", "high"]
+        cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "44100"]
+        cmd += base_meta + ["-f", "flv", rtmp_url]
+        log.info(f"[QUALIDADE] reencodando 1080p/keyframe2s/{KBPS}k via {enc}")
+        return cmd
+    # PC fraco / sem placa: repasse original (nao mexe na CPU)
+    log.info(f"[QUALIDADE] sem encoder de hardware ({enc}) — repassando -c:v copy (modo leve p/ CPU)")
+    return [FFMPEG, "-hide_banner", "-loglevel", "warning",
+            "-fflags", "+genpts+discardcorrupt",
+            "-f", "webm", "-i", "pipe:0",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100"] + base_meta + ["-f", "flv", rtmp_url]
+
+
 async def _handle_rtmp(websocket, qs):
     rtmp_url  = qs["rtmp"][0]
     proxy_url = qs.get("proxy", [None])[0]
@@ -158,17 +227,7 @@ async def _handle_rtmp(websocket, qs):
         env["https_proxy"] = f"http://{proxy_url}"
 
     ffmpeg_log = os.path.join(os.path.expanduser("~"), ".blacklive_ffmpeg.log")
-    ffmpeg_cmd = [
-        FFMPEG, "-hide_banner", "-loglevel", "warning",
-        "-fflags", "+genpts+discardcorrupt",
-        "-f", "webm", "-i", "pipe:0",
-        "-c:v", "copy",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-        "-user_agent", "TikTokLiveStudio/0.46.1",
-        "-metadata", "title=TikTok Live Studio",
-        "-metadata", "encoder=TikTok Live Studio 0.46.1",
-        "-f", "flv", rtmp_url
-    ]
+    ffmpeg_cmd = _build_tx_cmd(rtmp_url)
 
     # v1.6.1: escrita via FILA + thread (nunca trava o relay). Se o ffmpeg ENTALA
     # (vivo mas surdo), a fila enche em ~20s -> mata e fecha a conexao NA HORA.
@@ -475,6 +534,23 @@ async def _handle_render(websocket):
 # chave, com religa automatico e anti-suspensao. Provado 27-28/08 no Mac:
 # 4-12% de 1 nucleo vs ~93% do navegador.
 
+import atexit
+def _mata_filhos_no_exit():
+    """App fechando: leva os motores junto (sem orfaos empurrando video velho)."""
+    try:
+        p = MODO_LEVE.get("proc")
+        if p:
+            p.kill()
+    except Exception:
+        pass
+    try:
+        c = MODO_LEVE.get("caff")
+        if c:
+            c.terminate()
+    except Exception:
+        pass
+atexit.register(_mata_filhos_no_exit)
+
 MODO_LEVE = {"video": None, "proc": None, "rtmp": None, "stop": False,
              "encoder": None, "mortes_rapidas": 0, "caff": None, "gen": 0,
              "ativo": False}
@@ -539,10 +615,19 @@ def _leve_cmd(rtmp_url):
     else:
         cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                 "-map", "0:v:0", "-map", "1:a:0"]
+    # TESTE EDICAO (29/08): relogio ao vivo desenhado pelo ffmpeg quando o sinal
+    # ~/.bl_leve_relogio.on existe (fase 1 do "leve editado")
+    _vf_extra = []
+    _rel = os.path.join(os.path.expanduser("~"), ".bl_leve_relogio.on")
+    if os.path.exists(_rel):
+        _fonte = "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if sys.platform == "darwin" else "C\\:/Windows/Fonts/arialbd.ttf"
+        _vf_extra = ["drawtext=fontfile='" + _fonte + "':expansion=strftime:text='%H\\:%M\\:%S':fontsize=54:fontcolor=white:box=1:boxcolor=black@0.45:boxborderw=14:x=(w-tw)/2:y=90"]
     if enc == "libx264":
         # sem hardware: reduz p/ 720 de largura pra aliviar a CPU
-        cmd += ["-vf", "scale=720:-2", "-c:v", "libx264", "-preset", "veryfast"]
+        cmd += ["-vf", ",".join(["scale=720:-2"] + _vf_extra), "-c:v", "libx264", "-preset", "veryfast"]
     else:
+        if _vf_extra:
+            cmd += ["-vf", ",".join(_vf_extra)]
         cmd += ["-c:v", enc]
         if enc == "h264_nvenc":
             cmd += ["-preset", "p4"]
