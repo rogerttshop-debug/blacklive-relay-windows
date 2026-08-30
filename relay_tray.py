@@ -126,7 +126,7 @@ def build_menu(Icon, Menu, MenuItem):
 
     # v1.6.1 "estabilidade": menu do MODO LEVE desligado neste release (codigo fica
     # dormente no local_relay.py; religamos o menu quando o modo leve for lancado)
-    MODO_LEVE_MENU = False   # build cliente Windows: menu do modo leve OFF
+    MODO_LEVE_MENU = False   # build cliente Windows
     itens = [
         MenuItem("🟢 Abrir Painel", on_abrir_painel, default=True),
         MenuItem("📡 Verificar Status", on_status),
@@ -157,12 +157,23 @@ def show_notification(msg):
 
 # ── Ícone gerado programaticamente (sem arquivo externo) ──────────────────────
 def create_icon_image():
+    # 1) tenta o ICONE DO RATO (icon.png) — bundle PyInstaller (_MEIPASS) ou pasta do script
+    try:
+        from PIL import Image
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        for cand in (os.path.join(base, "icon.png"),
+                     os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")):
+            if os.path.isfile(cand):
+                return Image.open(cand).convert("RGBA")
+    except Exception:
+        pass
+    # 2) fallback: desenha circulo vermelho + play (se o rato nao for achado)
     try:
         from PIL import Image, ImageDraw
         img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        draw.ellipse([4, 4, 60, 60], fill=(220, 38, 38, 255))   # vermelho
-        draw.polygon([(22, 16), (22, 48), (50, 32)], fill=(255, 255, 255, 255))  # play
+        draw.ellipse([4, 4, 60, 60], fill=(220, 38, 38, 255))
+        draw.polygon([(22, 16), (22, 48), (50, 32)], fill=(255, 255, 255, 255))
         return img
     except Exception:
         return None
