@@ -32,5 +32,5 @@ jobs:
     - name: Upload EXE artifact
       uses: actions/upload-artifact@v4
       with:
-        name: BlackLive-Relay-Windows
-        path: dist/BlackLive-Relay.exe
+        name: Black-Live-Windows
+        path: "dist/Black Live.exe"
