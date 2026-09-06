@@ -25,7 +25,7 @@ import logging
 import threading
 
 PORT    = 8902
-VERSION = "1.6.2"
+VERSION = "1.6.4"
 VPS_URL = "https://blacklive.com.br"
 
 ALLOWED_ORIGINS = {
@@ -34,6 +34,62 @@ ALLOWED_ORIGINS = {
     "http://localhost:8900",
     "http://127.0.0.1:8900",
 }
+
+# ── FIX Chrome 152+ ("Private Network Access") ────────────────────────────────
+# O Chrome novo manda um preflight OPTIONS antes de deixar o site (https) falar
+# com o app local (ws://127.0.0.1). A lib websockets so aceita GET e derrubava o
+# preflight -> "Nao consegui falar com o app Black Live!" mesmo com a permissao
+# "Acesso a rede local" liberada. Patch: aceita OPTIONS e responde autorizando
+# SOMENTE as nossas origens (ALLOWED_ORIGINS). Validado em teste local 06/09.
+def _instala_fix_pna():
+    try:
+        import websockets.http11 as _h11
+        def _parse_allow_options(cls, read_line):
+            # copia do Request.parse da websockets 15.0.1, aceitando OPTIONS
+            try:
+                request_line = yield from _h11.parse_line(read_line)
+            except EOFError as exc:
+                raise EOFError("connection closed while reading HTTP request line") from exc
+            try:
+                method, raw_path, protocol = request_line.split(b" ", 2)
+            except ValueError:
+                raise ValueError("invalid HTTP request line") from None
+            if protocol != b"HTTP/1.1":
+                raise ValueError("unsupported protocol; expected HTTP/1.1")
+            if method not in (b"GET", b"OPTIONS"):
+                raise ValueError(f"unsupported HTTP method: {method!r}")
+            path = raw_path.decode("ascii", "surrogateescape")
+            headers = yield from _h11.parse_headers(read_line)
+            if "Transfer-Encoding" in headers:
+                raise NotImplementedError("transfer codings aren't supported")
+            if "Content-Length" in headers and not (method == b"OPTIONS" and headers["Content-Length"] == "0"):
+                raise ValueError("unsupported request body")
+            req = cls(path, headers)
+            if method == b"OPTIONS":
+                headers["X-BL-Preflight"] = "1"
+            return req
+        _h11.Request.parse = classmethod(_parse_allow_options)
+        log.info("Fix PNA (Chrome 152+) instalado: preflight OPTIONS aceito")
+    except Exception as e:
+        log.warning(f"Fix PNA nao instalado ({e}) — relay segue como antes")
+
+def pna_process_request(connection, request):
+    """Responde o preflight do Chrome autorizando rede local (so p/ nossas origens)."""
+    try:
+        h = request.headers
+        if h.get("X-BL-Preflight") == "1" or h.get("Access-Control-Request-Private-Network") == "true":
+            origin = h.get("Origin", "")
+            resp = connection.respond(200, "")
+            if origin in ALLOWED_ORIGINS:
+                resp.headers["Access-Control-Allow-Origin"] = origin
+                resp.headers["Access-Control-Allow-Private-Network"] = "true"
+                resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+                resp.headers["Access-Control-Allow-Headers"] = "*"
+                resp.headers["Access-Control-Max-Age"] = "86400"
+            return resp
+    except Exception as e:
+        log.warning(f"pna_process_request erro: {e}")
+    return None
 
 # ── FFmpeg bundled via imageio_ffmpeg ─────────────────────────────────────────
 def get_ffmpeg():
@@ -778,6 +834,7 @@ async def main():
         subprocess.run([sys.executable, "-m", "pip", "install", "websockets"], check=True)
         import websockets
 
+    _instala_fix_pna()   # Chrome 152+: aceita o preflight de "Acesso a rede local"
     log.info(f"BlackLive Local Relay v{VERSION} iniciado | FFmpeg: {FFMPEG}")
 
     # Auto-update em background — não bloqueia o start
@@ -789,6 +846,7 @@ async def main():
                 handle_safe,
                 "127.0.0.1",
                 PORT,
+                process_request=pna_process_request,   # preflight Chrome 152+ (rede local)
                 max_size=100 * 1024 * 1024,
                 ping_interval=20,
                 ping_timeout=60,
