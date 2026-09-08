@@ -421,7 +421,10 @@ class ComposeSession:
         bg = idx
         if getattr(self, "audio_live", False):
             # áudio AO VIVO do navegador (mix do painel: blocos+mic+efeitos) via stdin
-            inputs += ["-thread_queue_size", "512", "-use_wallclock_as_timestamps", "1", "-f", "webm", "-i", "pipe:0"]
+            # MESMA receita do modo basico (_build_tx_cmd), provada no Windows: genpts regenera
+            # timestamp suave (sem backward-DTS travando o muxer) e discardcorrupt joga fora
+            # pacote corrompido em vez de virar CHIADO. (wallclock dava jitter/chiado no Windows.)
+            inputs += ["-thread_queue_size", "1024", "-fflags", "+genpts+discardcorrupt", "-f", "webm", "-i", "pipe:0"]
         else:
             inputs += ["-stream_loop", "-1", "-re", "-i", audio_path]   # narração em loop, real-time
         aud = idx + 1
@@ -497,7 +500,7 @@ class ComposeSession:
                 "-map", "[outv]", "-map", "[outa]",
                 *vc,
                 "-fps_mode", "cfr", "-r", "30",   # cadencia CONSTANTE 30fps (anti-engasgo da camera ao vivo)
-                "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100",   # IGUAL ao modo basico (provado no Windows)
                 "-user_agent", "TikTokLiveStudio/0.46.1",
                 "-metadata", "title=TikTok Live Studio",
                 "-metadata", "encoder=TikTok Live Studio 0.46.1",
