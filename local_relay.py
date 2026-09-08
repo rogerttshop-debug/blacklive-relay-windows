@@ -25,7 +25,7 @@ import logging
 import threading
 
 PORT    = 8902
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 VPS_URL = "https://blacklive.com.br"
 
 ALLOWED_ORIGINS = {
@@ -213,6 +213,8 @@ async def handle(websocket):
             elif not rtmp.startswith("rtmp"):
                 await websocket.send(json.dumps({"ok": False, "erro": "chave_invalida"}))
             else:
+                # escolha de audio do painel: "video" (audio do arquivo) ou "mudo" (silencio)
+                MODO_LEVE["audio"] = "mudo" if str(_dados.get("audio", "")).strip() == "mudo" else "video"
                 ok_l = leve_iniciar(rtmp)
                 if ok_l:
                     log.info("[LEVE] ligado pelo painel (1 clique)")
@@ -846,9 +848,10 @@ def _leve_cmd(rtmp_url):
     if enc == "h264_videotoolbox":
         cmd += ["-hwaccel", "videotoolbox"]
     cmd += ["-stream_loop", "-1", "-re", "-fflags", "+genpts", "-i", video]
-    if _leve_tem_audio(video):
+    if _leve_tem_audio(video) and MODO_LEVE.get("audio", "video") != "mudo":
         cmd += ["-map", "0:v:0", "-map", "0:a:0"]
     else:
+        # arquivo sem audio OU cliente escolheu SEM AUDIO -> silencio valido (live nao cai)
         cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                 "-map", "0:v:0", "-map", "1:a:0"]
     # TESTE EDICAO (29/08): relogio ao vivo desenhado pelo ffmpeg quando o sinal
@@ -912,7 +915,7 @@ def _leve_push_loop(gen):
                 _notify("❌ Erro ao iniciar (veja o arquivo de log)")
                 break
             MODO_LEVE["proc"] = proc
-            _notify("🚀 Black Live NO AR — pode ate fechar o navegador")
+            _notify("🚀 Black Live NO AR")
             proc.wait()
             MODO_LEVE["proc"] = None
             if MODO_LEVE["stop"] or MODO_LEVE["gen"] != gen:
