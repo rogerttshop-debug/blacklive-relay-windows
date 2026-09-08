@@ -25,7 +25,7 @@ import logging
 import threading
 
 PORT    = 8902
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 VPS_URL = "https://blacklive.com.br"
 
 ALLOWED_ORIGINS = {

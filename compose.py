@@ -65,17 +65,24 @@ def _screen_input():
     return ["-f", "x11grab", "-framerate", "30", "-i", ":0.0"]
 
 
+def _font_filtersafe(p):
+    """Caminho da fonte SEGURO pro filtergraph do ffmpeg (Windows): barra pra frente + ':' do drive escapado.
+    Sem isso, 'C:\\Windows\\Fonts\\arialbd.ttf' quebra o drawtext no Windows (EINVAL -22). No Mac/Linux (sem ':') fica igual."""
+    if not p:
+        return p
+    return p.replace("\\", "/").replace(":", "\\:")
+
 def _font_path():
-    """Fonte cross-platform pro drawtext (ticker/relógio)."""
+    """Fonte cross-platform pro drawtext (ticker/relógio). Retorna JA seguro pro filtro."""
     cands = [
         os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "DejaVuSans-Bold.ttf"),
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",         # Mac
-        "C:\\\\Windows\\\\Fonts\\\\arialbd.ttf",                       # Windows
+        "C:/Windows/Fonts/arialbd.ttf",                              # Windows (barra pra frente; os.path.isfile aceita)
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",       # Linux
     ]
     for c in cands:
         if os.path.isfile(c):
-            return c
+            return _font_filtersafe(c)
     return ""
 
 
