@@ -25,7 +25,7 @@ import logging
 import threading
 
 PORT    = 8902
-VERSION = "1.8.5"
+VERSION = "1.8.6"
 VPS_URL = "https://blacklive.com.br"
 
 ALLOWED_ORIGINS = {
@@ -216,29 +216,36 @@ async def handle(websocket):
                 # escolha de audio: "video" (audio do arquivo), "mudo" (silencio) ou
                 # "aovivo" (blocos/picotador/mic/narracao do navegador via este WS)
                 _amode = str(_dados.get("audio", "")).strip()
-                if _amode not in ("mudo", "aovivo"):
+                if _amode not in ("mudo", "aovivo", "ambos"):
                     _amode = "video"
                 MODO_LEVE["audio"] = _amode
-                if _amode == "aovivo":
+                if _amode in ("aovivo", "ambos"):
                     import queue as _queue
                     myq = _queue.Queue(maxsize=400)   # ~cap: dropa o mais velho, nunca infla
                     MODO_LEVE["audio_q"] = myq
+                    MODO_LEVE["audio_hdr"] = None     # sessao nova = cabecalho webm novo
                     MODO_LEVE["audio_ws_vivo"] = True
                 ok_l = leve_iniciar(rtmp)
                 if ok_l:
                     log.info("[LEVE] ligado pelo painel (1 clique, audio=%s)" % _amode)
                 await websocket.send(json.dumps({"ok": bool(ok_l),
                     "video": os.path.basename(MODO_LEVE["video"])}))
-                if ok_l and _amode == "aovivo":
-                    # MANTEM o WS aberto recebendo o audio ao vivo do navegador
+                if ok_l and _amode in ("aovivo", "ambos"):
+                    # MANTEM o WS aberto recebendo o audio ao vivo do navegador.
+                    # O 1o chunk e o CABECALHO webm — guarda separado (o writer escreve
+                    # ele primeiro em CADA ffmpeg, inclusive na religa).
                     try:
                         async for amsg in websocket:
                             if isinstance(amsg, (bytes, bytearray)):
+                                b = bytes(amsg)
+                                if MODO_LEVE.get("audio_hdr") is None:
+                                    MODO_LEVE["audio_hdr"] = b
+                                    continue
                                 try:
-                                    myq.put_nowait(bytes(amsg))
+                                    myq.put_nowait(b)
                                 except Exception:
                                     try:
-                                        myq.get_nowait(); myq.put_nowait(bytes(amsg))  # dropa o mais velho
+                                        myq.get_nowait(); myq.put_nowait(b)  # dropa o mais velho
                                     except Exception:
                                         pass
                     except Exception:
@@ -246,7 +253,7 @@ async def handle(websocket):
                     finally:
                         MODO_LEVE["audio_ws_vivo"] = False
                         # navegador saiu -> cai pro audio do proprio video pra live NAO morrer
-                        if MODO_LEVE["ativo"] and not MODO_LEVE["stop"] and MODO_LEVE.get("audio") == "aovivo":
+                        if MODO_LEVE["ativo"] and not MODO_LEVE["stop"] and MODO_LEVE.get("audio") in ("aovivo", "ambos"):
                             log.info("[LEVE] navegador saiu do audio ao vivo -> fallback p/ audio do video")
                             MODO_LEVE["audio"] = "video"
                             try: myq.put_nowait(None)
@@ -825,7 +832,8 @@ except Exception:
 
 MODO_LEVE = {"video": None, "proc": None, "rtmp": None, "stop": False,
              "encoder": None, "mortes_rapidas": 0, "caff": None, "gen": 0,
-             "ativo": False, "audio": "video", "audio_q": None, "audio_ws_vivo": False}
+             "ativo": False, "audio": "video", "audio_q": None, "audio_ws_vivo": False,
+             "audio_hdr": None}
 NOTIFY = [None]   # relay_tray injeta show_notification aqui
 
 def _notify(msg):
@@ -883,34 +891,50 @@ def _leve_cmd(rtmp_url):
         cmd += ["-hwaccel", "videotoolbox"]
     cmd += ["-stream_loop", "-1", "-re", "-fflags", "+genpts", "-i", video]
     _amodo = MODO_LEVE.get("audio", "video")
-    if _amodo == "aovivo":
-        # AUDIO AO VIVO do navegador (blocos + picotador + mic + narracao) via stdin,
-        # mesma receita provada no compose/basico. O audio do proprio video e ignorado.
+    _tem_a = _leve_tem_audio(video)
+    _ao_vivo = _amodo in ("aovivo", "ambos")   # blocos/picotador/mic do navegador via pipe
+    if _ao_vivo:
         cmd += ["-thread_queue_size", "1024", "-fflags", "+genpts+discardcorrupt",
-                "-f", "webm", "-i", "pipe:0",
-                "-map", "0:v:0", "-map", "1:a:0"]
-    elif _leve_tem_audio(video) and _amodo != "mudo":
-        cmd += ["-map", "0:v:0", "-map", "0:a:0"]
-    else:
-        # arquivo sem audio OU cliente escolheu SEM AUDIO -> silencio valido (live nao cai)
-        cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                "-map", "0:v:0", "-map", "1:a:0"]
-    # TESTE EDICAO (29/08): relogio ao vivo desenhado pelo ffmpeg quando o sinal
-    # ~/.bl_leve_relogio.on existe (fase 1 do "leve editado")
+                "-f", "webm", "-i", "pipe:0"]
+
+    # filtro de video (scale p/ libx264 + relogio de teste opcional)
     _vf_extra = []
+    if enc == "libx264":
+        _vf_extra.append("scale=720:-2")   # sem hardware: reduz p/ aliviar a CPU
     _rel = os.path.join(os.path.expanduser("~"), ".bl_leve_relogio.on")
     if os.path.exists(_rel):
         _fonte = "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if sys.platform == "darwin" else "C\\:/Windows/Fonts/arialbd.ttf"
-        _vf_extra = ["drawtext=fontfile='" + _fonte + "':expansion=strftime:text='%H\\:%M\\:%S':fontsize=54:fontcolor=white:box=1:boxcolor=black@0.45:boxborderw=14:x=(w-tw)/2:y=90"]
-    if enc == "libx264":
-        # sem hardware: reduz p/ 720 de largura pra aliviar a CPU
-        cmd += ["-vf", ",".join(["scale=720:-2"] + _vf_extra), "-c:v", "libx264", "-preset", "veryfast"]
-    else:
+        _vf_extra.append("drawtext=fontfile='" + _fonte + "':expansion=strftime:text='%H\\:%M\\:%S':fontsize=54:fontcolor=white:box=1:boxcolor=black@0.45:boxborderw=14:x=(w-tw)/2:y=90")
+
+    if _ao_vivo and _amodo == "ambos" and _tem_a:
+        # COM audio do video: mistura audio do arquivo + audio ao vivo do navegador.
+        # filter_complex (nao pode conviver com -vf, entao o filtro de video entra junto)
+        if _vf_extra:
+            fc = "[0:v]" + ",".join(_vf_extra) + "[vout];[0:a][1:a]amix=inputs=2:duration=first:normalize=0[aout]"
+            cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "[aout]"]
+        else:
+            cmd += ["-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:normalize=0[aout]",
+                    "-map", "0:v:0", "-map", "[aout]"]
+    elif _ao_vivo:
+        # SEM audio do video: so o audio ao vivo (blocos/picotador); video mudo
         if _vf_extra:
             cmd += ["-vf", ",".join(_vf_extra)]
-        cmd += ["-c:v", enc]
-        if enc == "h264_nvenc":
-            cmd += ["-preset", "p4"]
+        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+    elif _tem_a and _amodo != "mudo":
+        if _vf_extra:
+            cmd += ["-vf", ",".join(_vf_extra)]
+        cmd += ["-map", "0:v:0", "-map", "0:a:0"]
+    else:
+        # arquivo sem audio OU mudo -> silencio valido (live nao cai)
+        cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+        if _vf_extra:
+            cmd += ["-vf", ",".join(_vf_extra)]
+        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+    cmd += ["-c:v", enc]
+    if enc == "libx264":
+        cmd += ["-preset", "veryfast"]
+    elif enc == "h264_nvenc":
+        cmd += ["-preset", "p4"]
     cmd += ["-b:v", "2500k", "-maxrate", "2500k", "-bufsize", "5000k", "-g", "60",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
@@ -991,7 +1015,21 @@ def _leve_push_loop(gen):
 
 def _leve_audio_writer(proc, gen, q):
     """Alimenta o ffmpeg do leve com o audio ao vivo (webm do navegador) via stdin.
-    Segue ESTE ffmpeg; morre junto com ele (na religa nasce um writer novo)."""
+    Segue ESTE ffmpeg; morre junto com ele (na religa nasce um writer novo).
+    CRITICO: escreve o CABECALHO webm primeiro (o 1o chunk do MediaRecorder) — sem ele
+    o ffmpeg falha o parse EBML do pipe:0 e morre em 0s (bug v1.8.5, parecia 'TikTok recusou')."""
+    t0 = time.time()
+    while time.time() - t0 < 12 and MODO_LEVE["gen"] == gen and not MODO_LEVE["stop"] and proc.poll() is None:
+        hdr = MODO_LEVE.get("audio_hdr")
+        if hdr:
+            try:
+                if proc.stdin and proc.poll() is None:
+                    proc.stdin.write(hdr)
+                    proc.stdin.flush()
+            except Exception:
+                pass
+            break
+        time.sleep(0.1)
     while MODO_LEVE["gen"] == gen and not MODO_LEVE["stop"] and proc.poll() is None:
         try:
             data = q.get(timeout=0.5)
@@ -1036,6 +1074,7 @@ def leve_desligar():
     """Desliga o modo leve por completo (para o push e esquece o video)."""
     MODO_LEVE["audio"] = "video"          # evita o fallback do audio ao vivo re-ligar
     MODO_LEVE["audio_ws_vivo"] = False
+    MODO_LEVE["audio_hdr"] = None
     try:
         if MODO_LEVE.get("audio_q"): MODO_LEVE["audio_q"].put_nowait(None)
     except Exception:
