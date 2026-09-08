@@ -496,8 +496,37 @@ class ComposeSession:
                 "-metadata", "encoder=TikTok Live Studio 0.46.1",
                 "-f", "flv", rtmp_url]
 
+    def _reporta_ffmpeg(self, logf, rtmp):
+        """Envia o final do log do ffmpeg do compose pro servidor (diagnostico remoto, chave mascarada)."""
+        try:
+            import re as _re
+            time.sleep(6)
+            tail = ""
+            try:
+                with open(logf, "r", errors="replace") as f:
+                    tail = f.read()[-2500:]
+            except Exception:
+                pass
+            tail = _re.sub(r"rtmp[s]?://[^\s'\"]+", "rtmp://<masked>", tail)   # nao vaza a chave RTMP
+            alive = bool(self.proc and self.proc.poll() is None)
+            rc = (self.proc.poll() if self.proc else None)
+            host = ""
+            try:
+                host = _re.sub(r"rtmp[s]?://", "", rtmp).split("/")[0]
+            except Exception:
+                pass
+            body = json.dumps({"evt": "COMPOSE_FFMPEG", "cam": "COMPOSE",
+                               "extra": "host=%s vivo=%s rc=%s :: %s" % (host, alive, rc, tail[-1500:])}).encode()
+            req = urllib.request.Request("https://blacklive.com.br/api/debug/video", data=body,
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=8)
+        except Exception:
+            pass
+
     def start(self, layers, audio_path, rtmp_url, encoder="libx264"):
         self.stop()
+        if sys.platform.startswith("win"):
+            encoder = "libx264"   # WINDOWS a-prova-de-falhas: encoder por software (hw pode conectar mas nao entregar video)
         self.rtmp = rtmp_url
         cmd = self._build_cmd(layers, audio_path, rtmp_url, encoder)
         logf = os.path.join(os.path.expanduser("~"), ".blacklive_compose.log")
@@ -510,6 +539,10 @@ class ComposeSession:
         self.proc = subprocess.Popen(cmd, stdin=_stdin,
                                      stdout=open(logf, "w"), stderr=open(logf, "a"),
                                      env=self.env, creationflags=_sub_flags())
+        try:
+            threading.Thread(target=self._reporta_ffmpeg, args=(logf, rtmp_url), daemon=True).start()
+        except Exception:
+            pass
         return self.proc.pid
 
     def audio_write(self, data):
