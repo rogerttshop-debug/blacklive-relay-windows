@@ -31,11 +31,14 @@ def _sub_flags():
 
 
 def _hwaccel_args():
-    """Decode por HARDWARE (tira o decode do video da CPU). Mac=videotoolbox; Win/Linux=auto (fallback software)."""
+    """Decode do video. Mac=videotoolbox (confiavel). Windows=SOFTWARE (a-prova-de-falhas):
+    o '-hwaccel auto' dava tela preta / video nao chegando em varias placas e com video
+    H.265 de celular; o decode por software decoda H.264 e H.265 sempre certo (custa um
+    pouco de CPU, mas nunca fica preto)."""
     if sys.platform == "darwin":
         return ["-hwaccel", "videotoolbox"]
     if sys.platform.startswith("win"):
-        return ["-hwaccel", "auto"]
+        return []   # software decode (robusto)
     return ["-hwaccel", "auto"]
 
 
