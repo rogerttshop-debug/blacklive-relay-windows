@@ -25,7 +25,7 @@ import logging
 import threading
 
 PORT    = 8902
-VERSION = "1.8.4"
+VERSION = "1.8.5"
 VPS_URL = "https://blacklive.com.br"
 
 ALLOWED_ORIGINS = {
@@ -213,13 +213,47 @@ async def handle(websocket):
             elif not rtmp.startswith("rtmp"):
                 await websocket.send(json.dumps({"ok": False, "erro": "chave_invalida"}))
             else:
-                # escolha de audio do painel: "video" (audio do arquivo) ou "mudo" (silencio)
-                MODO_LEVE["audio"] = "mudo" if str(_dados.get("audio", "")).strip() == "mudo" else "video"
+                # escolha de audio: "video" (audio do arquivo), "mudo" (silencio) ou
+                # "aovivo" (blocos/picotador/mic/narracao do navegador via este WS)
+                _amode = str(_dados.get("audio", "")).strip()
+                if _amode not in ("mudo", "aovivo"):
+                    _amode = "video"
+                MODO_LEVE["audio"] = _amode
+                if _amode == "aovivo":
+                    import queue as _queue
+                    myq = _queue.Queue(maxsize=400)   # ~cap: dropa o mais velho, nunca infla
+                    MODO_LEVE["audio_q"] = myq
+                    MODO_LEVE["audio_ws_vivo"] = True
                 ok_l = leve_iniciar(rtmp)
                 if ok_l:
-                    log.info("[LEVE] ligado pelo painel (1 clique)")
+                    log.info("[LEVE] ligado pelo painel (1 clique, audio=%s)" % _amode)
                 await websocket.send(json.dumps({"ok": bool(ok_l),
                     "video": os.path.basename(MODO_LEVE["video"])}))
+                if ok_l and _amode == "aovivo":
+                    # MANTEM o WS aberto recebendo o audio ao vivo do navegador
+                    try:
+                        async for amsg in websocket:
+                            if isinstance(amsg, (bytes, bytearray)):
+                                try:
+                                    myq.put_nowait(bytes(amsg))
+                                except Exception:
+                                    try:
+                                        myq.get_nowait(); myq.put_nowait(bytes(amsg))  # dropa o mais velho
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+                    finally:
+                        MODO_LEVE["audio_ws_vivo"] = False
+                        # navegador saiu -> cai pro audio do proprio video pra live NAO morrer
+                        if MODO_LEVE["ativo"] and not MODO_LEVE["stop"] and MODO_LEVE.get("audio") == "aovivo":
+                            log.info("[LEVE] navegador saiu do audio ao vivo -> fallback p/ audio do video")
+                            MODO_LEVE["audio"] = "video"
+                            try: myq.put_nowait(None)
+                            except Exception: pass
+                            try: leve_iniciar(MODO_LEVE["rtmp"] or rtmp)
+                            except Exception: pass
+                    return
         elif cmd == "desligar":
             leve_desligar()
             await websocket.send(json.dumps({"ok": True, "video": None}))
@@ -791,7 +825,7 @@ except Exception:
 
 MODO_LEVE = {"video": None, "proc": None, "rtmp": None, "stop": False,
              "encoder": None, "mortes_rapidas": 0, "caff": None, "gen": 0,
-             "ativo": False}
+             "ativo": False, "audio": "video", "audio_q": None, "audio_ws_vivo": False}
 NOTIFY = [None]   # relay_tray injeta show_notification aqui
 
 def _notify(msg):
@@ -848,7 +882,14 @@ def _leve_cmd(rtmp_url):
     if enc == "h264_videotoolbox":
         cmd += ["-hwaccel", "videotoolbox"]
     cmd += ["-stream_loop", "-1", "-re", "-fflags", "+genpts", "-i", video]
-    if _leve_tem_audio(video) and MODO_LEVE.get("audio", "video") != "mudo":
+    _amodo = MODO_LEVE.get("audio", "video")
+    if _amodo == "aovivo":
+        # AUDIO AO VIVO do navegador (blocos + picotador + mic + narracao) via stdin,
+        # mesma receita provada no compose/basico. O audio do proprio video e ignorado.
+        cmd += ["-thread_queue_size", "1024", "-fflags", "+genpts+discardcorrupt",
+                "-f", "webm", "-i", "pipe:0",
+                "-map", "0:v:0", "-map", "1:a:0"]
+    elif _leve_tem_audio(video) and _amodo != "mudo":
         cmd += ["-map", "0:v:0", "-map", "0:a:0"]
     else:
         # arquivo sem audio OU cliente escolheu SEM AUDIO -> silencio valido (live nao cai)
@@ -906,10 +947,20 @@ def _leve_push_loop(gen):
         while not MODO_LEVE["stop"] and MODO_LEVE["gen"] == gen:
             t0 = time.time()
             try:
+                _aovivo = MODO_LEVE.get("audio") == "aovivo"
                 proc = subprocess.Popen(_leve_cmd(rtmp_url),
+                                        stdin=(subprocess.PIPE if _aovivo else subprocess.DEVNULL),
                                         stdout=open(lelog, "a"),
                                         stderr=subprocess.STDOUT,
                                         creationflags=_sub_flags())
+                if _aovivo and MODO_LEVE.get("audio_q") is not None:
+                    _q = MODO_LEVE["audio_q"]
+                    try:                                   # esvazia backlog -> audio FRESCO no (re)start
+                        while True: _q.get_nowait()
+                    except Exception:
+                        pass
+                    threading.Thread(target=_leve_audio_writer, args=(proc, gen, _q),
+                                     daemon=True, name="leve-audio").start()
             except Exception as e:
                 log.error(f"[LEVE] falha ao iniciar ffmpeg: {e}")
                 _notify("❌ Erro ao iniciar (veja o arquivo de log)")
@@ -938,6 +989,27 @@ def _leve_push_loop(gen):
         _leve_anti_sleep(False)
         log.info("[LEVE] loop encerrado")
 
+def _leve_audio_writer(proc, gen, q):
+    """Alimenta o ffmpeg do leve com o audio ao vivo (webm do navegador) via stdin.
+    Segue ESTE ffmpeg; morre junto com ele (na religa nasce um writer novo)."""
+    while MODO_LEVE["gen"] == gen and not MODO_LEVE["stop"] and proc.poll() is None:
+        try:
+            data = q.get(timeout=0.5)
+        except Exception:
+            continue
+        if data is None:
+            break
+        try:
+            if proc.stdin and proc.poll() is None:
+                proc.stdin.write(data)
+                proc.stdin.flush()
+        except Exception:
+            break
+    try:
+        if proc.stdin: proc.stdin.close()
+    except Exception:
+        pass
+
 def leve_iniciar(rtmp_url):
     """Chamado quando o navegador SOLTA a live (PARAR) e ha video escolhido."""
     if not (MODO_LEVE["video"] and os.path.isfile(MODO_LEVE["video"])):
@@ -962,6 +1034,12 @@ def leve_parar_push():
 
 def leve_desligar():
     """Desliga o modo leve por completo (para o push e esquece o video)."""
+    MODO_LEVE["audio"] = "video"          # evita o fallback do audio ao vivo re-ligar
+    MODO_LEVE["audio_ws_vivo"] = False
+    try:
+        if MODO_LEVE.get("audio_q"): MODO_LEVE["audio_q"].put_nowait(None)
+    except Exception:
+        pass
     leve_parar_push()
     MODO_LEVE["video"] = None
 
