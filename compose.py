@@ -414,7 +414,7 @@ class ComposeSession:
         bg = idx
         if getattr(self, "audio_live", False):
             # áudio AO VIVO do navegador (mix do painel: blocos+mic+efeitos) via stdin
-            inputs += ["-thread_queue_size", "512", "-f", "webm", "-i", "pipe:0"]
+            inputs += ["-thread_queue_size", "512", "-use_wallclock_as_timestamps", "1", "-f", "webm", "-i", "pipe:0"]
         else:
             inputs += ["-stream_loop", "-1", "-re", "-i", audio_path]   # narração em loop, real-time
         aud = idx + 1
@@ -525,8 +525,6 @@ class ComposeSession:
 
     def start(self, layers, audio_path, rtmp_url, encoder="libx264"):
         self.stop()
-        if sys.platform.startswith("win"):
-            encoder = "libx264"   # WINDOWS a-prova-de-falhas: encoder por software (hw pode conectar mas nao entregar video)
         self.rtmp = rtmp_url
         cmd = self._build_cmd(layers, audio_path, rtmp_url, encoder)
         logf = os.path.join(os.path.expanduser("~"), ".blacklive_compose.log")
