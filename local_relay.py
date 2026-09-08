@@ -25,7 +25,7 @@ import logging
 import threading
 
 PORT    = 8902
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 VPS_URL = "https://blacklive.com.br"
 
 ALLOWED_ORIGINS = {
@@ -194,14 +194,30 @@ async def handle(websocket):
     if parsed.path == "/leve":
         try:
             msg = await asyncio.wait_for(websocket.recv(), timeout=10)
-            cmd = json.loads(msg).get("cmd", "")
+            _dados = json.loads(msg)
+            cmd = _dados.get("cmd", "")
         except Exception:
+            _dados = {}
             cmd = "status"
         if cmd == "escolher":
             loop = asyncio.get_event_loop()
             path = await loop.run_in_executor(None, leve_escolher_video)
             await websocket.send(json.dumps({"ok": bool(path),
                 "video": os.path.basename(path) if path else None}))
+        elif cmd == "ligar":
+            # 1 CLIQUE (v1.8.3): o painel manda a chave direto — igual aos outros modos,
+            # sem o "transmitir e clicar PARAR". O takeover antigo continua como fallback.
+            rtmp = str(_dados.get("rtmp", "")).strip()
+            if not (MODO_LEVE["video"] and os.path.isfile(MODO_LEVE["video"])):
+                await websocket.send(json.dumps({"ok": False, "erro": "sem_video"}))
+            elif not rtmp.startswith("rtmp"):
+                await websocket.send(json.dumps({"ok": False, "erro": "chave_invalida"}))
+            else:
+                ok_l = leve_iniciar(rtmp)
+                if ok_l:
+                    log.info("[LEVE] ligado pelo painel (1 clique)")
+                await websocket.send(json.dumps({"ok": bool(ok_l),
+                    "video": os.path.basename(MODO_LEVE["video"])}))
         elif cmd == "desligar":
             leve_desligar()
             await websocket.send(json.dumps({"ok": True, "video": None}))
