@@ -85,15 +85,15 @@ def build_menu(Icon, Menu, MenuItem):
     def on_status(_):
         v = ping_relay()
         if v:
-            show_notification(f"✅ Relay ativo — v{v}")
+            show_notification(f"✅ Black Live conectado — v{v}")
         else:
-            show_notification("❌ Relay não está respondendo")
+            show_notification("❌ Black Live não está respondendo")
 
     def on_restart(_):
         stop_relay()
         time.sleep(1)
         start_relay()
-        show_notification("🔄 Relay reiniciado")
+        show_notification("🔄 Black Live reiniciado")
 
     def on_quit(_):
         stop_relay()
@@ -104,7 +104,7 @@ def build_menu(Icon, Menu, MenuItem):
             import local_relay
             p = local_relay.leve_escolher_video()
             if p:
-                show_notification("🎬 Modo Leve armado: %s — transmita pelo painel e clique PARAR" % os.path.basename(p))
+                show_notification("🎬 Vídeo armado: %s — transmita pelo painel e clique PARAR" % os.path.basename(p))
             else:
                 show_notification("Nenhum vídeo escolhido")
         threading.Thread(target=_escolher, daemon=True).start()
@@ -113,20 +113,20 @@ def build_menu(Icon, Menu, MenuItem):
         import local_relay
         ml = local_relay.MODO_LEVE
         if ml["ativo"]:
-            show_notification("🚀 Modo Leve NO AR (%s)" % (ml["encoder"] or "?"))
+            show_notification("🚀 Black Live NO AR")
         elif ml["video"]:
             show_notification("🎬 Armado: %s — transmita e clique PARAR" % os.path.basename(ml["video"]))
         else:
-            show_notification("Modo Leve desligado — escolha um vídeo no menu")
+            show_notification("Desligado — escolha um vídeo no menu")
 
     def on_leve_off(_):
         import local_relay
         local_relay.leve_desligar()
-        show_notification("⏹ Modo Leve desligado")
+        show_notification("⏹ Desligado")
 
     # v1.6.1 "estabilidade": menu do MODO LEVE desligado neste release (codigo fica
     # dormente no local_relay.py; religamos o menu quando o modo leve for lancado)
-    MODO_LEVE_MENU = False   # build cliente Windows
+    MODO_LEVE_MENU = True   # LIGADO só na copia local do John (teste); build dos clientes segue False
     itens = [
         MenuItem("🟢 Abrir Painel", on_abrir_painel, default=True),
         MenuItem("📡 Verificar Status", on_status),
@@ -134,13 +134,13 @@ def build_menu(Icon, Menu, MenuItem):
     if MODO_LEVE_MENU:
         itens += [
             Menu.SEPARATOR,
-            MenuItem("🎬 Modo Leve — escolher vídeo", on_leve_video),
-            MenuItem("📊 Modo Leve — status", on_leve_status),
-            MenuItem("⏹ Modo Leve — desligar", on_leve_off),
+            MenuItem("🎬 Escolher vídeo", on_leve_video),
+            MenuItem("📊 Status da transmissão", on_leve_status),
+            MenuItem("⏹ Desligar", on_leve_off),
         ]
     itens += [
         Menu.SEPARATOR,
-        MenuItem("🔄 Reiniciar Relay", on_restart),
+        MenuItem("🔄 Reiniciar Black Live", on_restart),
         Menu.SEPARATOR,
         MenuItem("❌ Encerrar", on_quit),
     ]
@@ -150,7 +150,7 @@ def build_menu(Icon, Menu, MenuItem):
 def show_notification(msg):
     try:
         if tray_icon:
-            tray_icon.notify(msg, "BlackLive Relay")
+            tray_icon.notify(msg, "Black Live")
     except Exception:
         pass
 
@@ -207,9 +207,9 @@ def main():
 
     menu = build_menu(pystray.Icon, pystray.Menu, pystray.MenuItem)
     tray_icon = pystray.Icon(
-        "BlackLive Relay",
+        "Black Live",
         icon_img,
-        "BlackLive Relay",
+        "Black Live",
         menu
     )
 

@@ -25,7 +25,7 @@ import logging
 import threading
 
 PORT    = 8902
-VERSION = "1.6.4"
+VERSION = "1.7.7"
 VPS_URL = "https://blacklive.com.br"
 
 ALLOWED_ORIGINS = {
@@ -184,6 +184,11 @@ async def handle(websocket):
         await _handle_render(websocket)
         return
 
+    # /compose — Jeito 2: composição AO VIVO no relay (câmera+layers) e push direto
+    if parsed.path == "/compose":
+        await _handle_compose(websocket)
+        return
+
     # /leve — controle do MODO LEVE pelo PAINEL (29/08): o botao fica na pagina,
     # o relay abre o seletor de arquivo na maquina. Sem caçar icone de bandeja.
     if parsed.path == "/leve":
@@ -216,22 +221,69 @@ async def handle(websocket):
 
 
 # ── Relay ao vivo: WebM → FFmpeg → RTMP ───────────────────────────────────────
+def _q_auto_off_path():
+    return os.path.join(os.path.expanduser("~"), ".bl_relay_qualidade.auto_off")
+
+def _qualidade_benchmark(enc):
+    """v1.6.3: mede se a maquina AGUENTA reencodar 1080p em tempo real (3s de teste
+    sintetico com o MESMO filtro/bitrate da transmissao). Precisa de folga (>=1.6x
+    tempo real) pra nao engasgar ao vivo junto com navegador+canvas."""
+    try:
+        t0 = time.time()
+        r = subprocess.run(
+            [FFMPEG, "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "testsrc2=size=720x1280:rate=30",
+             "-t", "3",
+             "-vf", "scale=1080:-2:flags=bicubic",
+             "-c:v", enc, "-b:v", "4500k",
+             "-f", "null", "-"],
+            capture_output=True, timeout=60, creationflags=_sub_flags())
+        dt = time.time() - t0
+        ok = (r.returncode == 0) and (dt > 0) and (3.0 / dt >= 1.6)
+        log.info(f"[QUALIDADE] benchmark {enc}: 3s codificados em {dt:.1f}s ({3.0/max(dt,0.001):.1f}x) -> {'QUALIDADE 1080p' if ok else 'modo leve (copy)'}")
+        return ok
+    except Exception as e:
+        log.warning(f"[QUALIDADE] benchmark falhou ({e}) -> modo leve (copy)")
+        return False
+
+def _qualidade_modo():
+    """v1.6.3: decide 1x por maquina (cache) se reencoda (hq) ou repassa (copy).
+    Ordem: .off manual > .auto_off (fallback ao vivo) > cache > benchmark."""
+    off = os.path.join(os.path.expanduser("~"), ".bl_relay_qualidade.off")
+    if os.path.exists(off):
+        return "copy", None, "desligado manualmente (.off)"
+    if os.path.exists(_q_auto_off_path()):
+        return "copy", None, "fallback automatico (PC nao acompanhou ao vivo)"
+    enc = leve_detectar_encoder()
+    if not enc or enc == "libx264":
+        return "copy", None, "sem encoder de hardware"
+    cache = os.path.join(os.path.expanduser("~"), ".bl_relay_qualidade.cache")
+    try:
+        c = json.load(open(cache))
+        if c.get("enc") == enc and c.get("modo") in ("hq", "copy"):
+            return c["modo"], enc, "cache do benchmark"
+    except Exception:
+        pass
+    modo = "hq" if _qualidade_benchmark(enc) else "copy"
+    try:
+        json.dump({"enc": enc, "modo": modo}, open(cache, "w"))
+    except Exception:
+        pass
+    return modo, enc, "benchmark"
+
 def _build_tx_cmd(rtmp_url):
-    """Monta o comando ffmpeg da transmissao.
-    QUALIDADE (v1.6.2): se a maquina tem encoder de HARDWARE (placa de video), reencoda
-    com keyframe fixo de 2s + bitrate estavel (como o TikTok Live Studio) — custo ~5-10%.
-    PC FRACO (so software/libx264): cai automatico pro repasse -c:v copy de sempre (nao
-    reencoda p/ nao sufocar a CPU). Ninguem trava.
-    Desliga a qualidade criando o arquivo ~/.bl_relay_qualidade.off (volta pro copy)."""
+    """Monta o comando ffmpeg da transmissao. Retorna (cmd, eh_hq).
+    QUALIDADE (v1.6.3): reencoda 1080p/keyframe2s SO se o benchmark provou que a
+    maquina aguenta em tempo real (placa fraca tipo Intel UHD cai no copy sozinha).
+    Se ainda assim engasgar ao vivo, o fallback grava .auto_off e religa no leve.
+    Desliga manualmente criando ~/.bl_relay_qualidade.off."""
     base_meta = [
         "-user_agent", "TikTokLiveStudio/0.46.1",
         "-metadata", "title=TikTok Live Studio",
         "-metadata", "encoder=TikTok Live Studio 0.46.1",
     ]
-    off = os.path.join(os.path.expanduser("~"), ".bl_relay_qualidade.off")
-    enc = leve_detectar_encoder()
-    tem_hw = enc and enc != "libx264"
-    if tem_hw and not os.path.exists(off):
+    modo, enc, motivo = _qualidade_modo()
+    if modo == "hq":
         # QUALIDADE por hardware: 1080p (largura), keyframe 2s (30fps -> g=60), bitrate estavel
         KBPS = 4500
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "warning",
@@ -251,15 +303,15 @@ def _build_tx_cmd(rtmp_url):
             cmd += ["-profile:v", "high"]
         cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "44100"]
         cmd += base_meta + ["-f", "flv", rtmp_url]
-        log.info(f"[QUALIDADE] reencodando 1080p/keyframe2s/{KBPS}k via {enc}")
-        return cmd
-    # PC fraco / sem placa: repasse original (nao mexe na CPU)
-    log.info(f"[QUALIDADE] sem encoder de hardware ({enc}) — repassando -c:v copy (modo leve p/ CPU)")
+        log.info(f"[QUALIDADE] reencodando 1080p/keyframe2s/{KBPS}k via {enc} ({motivo})")
+        return cmd, True
+    # PC fraco / sem placa / fallback: repasse original (nao mexe na CPU)
+    log.info(f"[QUALIDADE] repassando -c:v copy — {motivo}")
     return [FFMPEG, "-hide_banner", "-loglevel", "warning",
             "-fflags", "+genpts+discardcorrupt",
             "-f", "webm", "-i", "pipe:0",
             "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100"] + base_meta + ["-f", "flv", rtmp_url]
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100"] + base_meta + ["-f", "flv", rtmp_url], False
 
 
 async def _handle_rtmp(websocket, qs):
@@ -283,7 +335,7 @@ async def _handle_rtmp(websocket, qs):
         env["https_proxy"] = f"http://{proxy_url}"
 
     ffmpeg_log = os.path.join(os.path.expanduser("~"), ".blacklive_ffmpeg.log")
-    ffmpeg_cmd = _build_tx_cmd(rtmp_url)
+    ffmpeg_cmd, _tx_hq = _build_tx_cmd(rtmp_url)
 
     # v1.6.1: escrita via FILA + thread (nunca trava o relay). Se o ffmpeg ENTALA
     # (vivo mas surdo), a fila enche em ~20s -> mata e fecha a conexao NA HORA.
@@ -325,11 +377,20 @@ async def _handle_rtmp(websocket, qs):
                     fila.put_nowait(msg)
                 except _q.Full:
                     log.warning("FFmpeg ENTALADO (fila cheia ~20s) — matando e fechando p/ religar")
+                    if _tx_hq:
+                        # v1.6.3 FALLBACK: a maquina nao acompanhou o reencode 1080p ao vivo.
+                        # Grava o auto_off -> o religa (20s) volta AUTOMATICO no modo leve (copy).
+                        try:
+                            open(_q_auto_off_path(), "w").write("entalou no modo qualidade — modo leve automatico")
+                        except Exception:
+                            pass
+                        _notify("⚠️ Ajustei a qualidade automaticamente (a live religa sozinha)")
                     try: proc.kill()
                     except Exception: pass
                     break
     except Exception as e:
         log.error(f"Erro no relay: {e}")
+        _notify("❌ Erro na transmissao — veja o arquivo de log")
     finally:
         try: proc.kill()          # kill primeiro: desbloqueia o writer se estiver preso
         except: pass
@@ -344,6 +405,78 @@ async def _handle_rtmp(websocket, qs):
                 log.info("[LEVE] assumindo a live na mesma chave")
         except Exception as _e:
             log.warning(f"[LEVE] falha ao assumir: {_e}")
+
+
+# ── Compose ao vivo (Jeito 2): relay compõe as camadas em tempo real e empurra ─
+async def _handle_compose(websocket):
+    import compose as _compose_mod
+    import urllib.request as _u
+    sess = _compose_mod.ComposeSession(FFMPEG, log, notify=_notify)
+    audio_path = os.path.join(os.path.expanduser("~"), ".blacklive_compose_audio.mp3")
+    cfg = {"layers": [], "rtmp": "", "proxy": "", "audio_url": ""}
+    enc = leve_detectar_encoder()
+    _notify("🎬 Black Live conectado")
+    try:
+        async for msg in websocket:
+            if isinstance(msg, (bytes, bytearray)):
+                # se estamos recebendo uma MIDIA (tem _pending) -> chunk de midia;
+                # senao -> é o AUDIO AO VIVO do navegador (pipe:0 do ffmpeg)
+                if sess._pending:
+                    sess.media_chunk(bytes(msg))
+                else:
+                    sess.audio_write(bytes(msg))
+                continue
+            try:
+                d = json.loads(msg)
+            except Exception:
+                continue
+            cmd = d.get("cmd", "")
+            if cmd == "config":
+                for k in ("layers", "rtmp", "proxy", "audio_url"):
+                    if k in d:
+                        cfg[k] = d[k]
+                sess.audio_live = bool(d.get("audio_live"))
+                try:
+                    sess.ch = int(d.get("canvas_h") or sess.ch)
+                    sess.cw = int(d.get("canvas_w") or sess.cw)
+                except Exception:
+                    pass
+                sess.set_proxy(cfg.get("proxy", ""))
+                await websocket.send(json.dumps({"status": "config_ok"}))
+            elif cmd == "media_begin":
+                sess.media_begin(d.get("media_id"), d.get("ext", "bin"), d.get("size", 0))
+                await websocket.send(json.dumps({"status": "media_ready", "media_id": d.get("media_id")}))
+            elif cmd == "media_url":
+                sess.add_media_url(d.get("media_id"), d.get("url", ""))
+            elif cmd == "go":
+                try:
+                    if cfg.get("audio_url"):
+                        _u.urlretrieve(cfg["audio_url"], audio_path)
+                    else:
+                        subprocess.run([FFMPEG, "-y", "-f", "lavfi", "-i",
+                                        "anullsrc=r=48000:cl=stereo", "-t", "2", audio_path],
+                                       capture_output=True, creationflags=_sub_flags())
+                except Exception as _ea:
+                    subprocess.run([FFMPEG, "-y", "-f", "lavfi", "-i",
+                                    "anullsrc=r=48000:cl=stereo", "-t", "2", audio_path],
+                                   capture_output=True, creationflags=_sub_flags())
+                    log.warning("[COMPOSE] audio falhou (%s) — silencio" % _ea)
+                pid = sess.start(cfg["layers"], audio_path, cfg["rtmp"], enc)
+                _notify("🔴 Black Live AO VIVO no ar")
+                await websocket.send(json.dumps({"status": "streaming", "pid": pid}))
+            elif cmd == "update":
+                cfg["layers"] = d.get("layers", cfg["layers"])
+                sess.start(cfg["layers"], audio_path, cfg["rtmp"], enc)   # rebuild (o "pisca" ao editar ao vivo)
+                await websocket.send(json.dumps({"status": "updated"}))
+            elif cmd == "stop":
+                sess.stop()
+                await websocket.send(json.dumps({"status": "stopped"}))
+                break
+    except Exception as e:
+        log.error("[COMPOSE] erro: %s" % e)
+    finally:
+        sess.cleanup()
+        log.info("[COMPOSE] sessao encerrada")
 
 
 # ── Render local: camadas → MP4 → upload VPS → VPS transmite ─────────────────
@@ -591,6 +724,32 @@ async def _handle_render(websocket):
 # 4-12% de 1 nucleo vs ~93% do navegador.
 
 import atexit
+def _kill_compose_leftovers():
+    """Mata o ffmpeg do COMPOSE (Jeito 2) por assinatura — inclusive ORFAOS (pai morreu).
+    Roda no fechar (atexit/sinal) E no abrir do relay (limpa orfao de crash anterior).
+    Sem isso, fechar o relay deixava o ffmpeg empurrando pro TikTok sozinho."""
+    try:
+        import psutil
+        for pr in psutil.process_iter(attrs=["pid", "cmdline"]):
+            try:
+                cl = " ".join(pr.info.get("cmdline") or [])
+                if "blcompose_" in cl or ".blacklive_compose_audio" in cl:
+                    pr.kill()
+            except Exception:
+                pass
+        return
+    except Exception:
+        pass
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.run(["wmic", "process", "where",
+                            "commandline like '%blcompose_%'", "delete"],
+                           capture_output=True, timeout=8)
+        else:
+            subprocess.run(["pkill", "-f", "blcompose_"], capture_output=True, timeout=8)
+    except Exception:
+        pass
+
 def _mata_filhos_no_exit():
     """App fechando: leva os motores junto (sem orfaos empurrando video velho)."""
     try:
@@ -605,7 +764,12 @@ def _mata_filhos_no_exit():
             c.terminate()
     except Exception:
         pass
+    _kill_compose_leftovers()
 atexit.register(_mata_filhos_no_exit)
+try:
+    signal.signal(signal.SIGTERM, lambda *_a: (_mata_filhos_no_exit(), os._exit(0)))
+except Exception:
+    pass
 
 MODO_LEVE = {"video": None, "proc": None, "rtmp": None, "stop": False,
              "encoder": None, "mortes_rapidas": 0, "caff": None, "gen": 0,
@@ -729,10 +893,10 @@ def _leve_push_loop(gen):
                                         creationflags=_sub_flags())
             except Exception as e:
                 log.error(f"[LEVE] falha ao iniciar ffmpeg: {e}")
-                _notify("❌ Modo Leve: erro ao iniciar (veja .blacklive_leve.log)")
+                _notify("❌ Erro ao iniciar (veja o arquivo de log)")
                 break
             MODO_LEVE["proc"] = proc
-            _notify(f"🚀 Modo Leve NO AR ({MODO_LEVE['encoder']}) — pode ate fechar o navegador")
+            _notify("🚀 Black Live NO AR — pode ate fechar o navegador")
             proc.wait()
             MODO_LEVE["proc"] = None
             if MODO_LEVE["stop"] or MODO_LEVE["gen"] != gen:
@@ -742,12 +906,12 @@ def _leve_push_loop(gen):
                 MODO_LEVE["mortes_rapidas"] += 1
                 if MODO_LEVE["mortes_rapidas"] >= 5:
                     log.error("[LEVE] 5 mortes rapidas — desistindo (live encerrada no TikTok?)")
-                    _notify("❌ Modo Leve: TikTok recusou a chave — transmita de novo pelo painel e clique PARAR")
+                    _notify("❌ TikTok recusou a chave — transmita de novo pelo painel e clique PARAR")
                     break
             else:
                 MODO_LEVE["mortes_rapidas"] = 0
             log.warning(f"[LEVE] ffmpeg caiu apos {int(rodou)}s — religando em 5s")
-            _notify("🔄 Modo Leve: religando a live...")
+            _notify("🔄 Religando a live...")
             time.sleep(5)
     finally:
         MODO_LEVE["proc"] = None
@@ -836,6 +1000,7 @@ async def main():
 
     _instala_fix_pna()   # Chrome 152+: aceita o preflight de "Acesso a rede local"
     log.info(f"BlackLive Local Relay v{VERSION} iniciado | FFmpeg: {FFMPEG}")
+    _kill_compose_leftovers()   # limpa ffmpeg de compose orfao de uma sessao/crash anterior
 
     # Auto-update em background — não bloqueia o start
     threading.Thread(target=check_update, daemon=True).start()
@@ -880,8 +1045,29 @@ async def main():
                 os._exit(1)
             _tent = MODO_LEVE.get("_port_retry", 0) + 1
             MODO_LEVE["_port_retry"] = _tent
+            if _tent == 2 and sys.platform.startswith("win"):
+                # v1.6.3 TAKEOVER: ha um Black Live CONGELADO segurando a porta (vivo no
+                # gerenciador, surdo no ping). Encerra os OUTROS processos do nosso exe e
+                # assume. PyInstaller onefile = 2 processos por instancia (pai bootloader +
+                # filho); preserva o proprio PID e o PID do pai.
+                log.warning("instancia congelada segurando a porta — encerrando ela e assumindo")
+                _notify("🔄 Encontrei um Black Live travado — encerrando ele e assumindo")
+                try:
+                    _meus = {os.getpid(), os.getppid()}
+                    for _img in ("Black Live.exe", "BlackLive-Relay.exe"):
+                        r = subprocess.run(["tasklist", "/FO", "CSV", "/FI", f"IMAGENAME eq {_img}"],
+                                           capture_output=True, text=True, timeout=15, creationflags=_sub_flags())
+                        for line in r.stdout.splitlines()[1:]:
+                            parts = [p.strip('"') for p in line.split('","')]
+                            if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) not in _meus:
+                                subprocess.run(["taskkill", "/F", "/PID", parts[1]],
+                                               capture_output=True, timeout=10, creationflags=_sub_flags())
+                                log.info(f"takeover: encerrei o processo congelado {_img} pid={parts[1]}")
+                except Exception as _tk:
+                    log.warning(f"takeover falhou: {_tk}")
             if _tent >= 6:
                 log.error(f"Porta {PORT} presa apos {_tent} tentativas ({e}). Encerrando.")
+                _notify("❌ Não consegui abrir a porta do Black Live — reinicie o computador")
                 os._exit(1)
             log.warning(f"Porta {PORT} ocupada sem relay vivo ({e}) — tentativa {_tent}/6, aguardando 5s...")
             await asyncio.sleep(5)
@@ -946,7 +1132,7 @@ if __name__ == "__main__":
     for _a in sys.argv[1:]:
         if os.path.isfile(_a):
             MODO_LEVE["video"] = _a
-            print(f"🎬 Modo Leve armado: {_a}\n   Transmita pelo painel e clique PARAR — o relay assume sozinho.")
+            print(f"🎬 Vídeo armado: {_a}\n   Transmita pelo painel e clique PARAR — o Black Live assume sozinho.")
             threading.Thread(target=leve_detectar_encoder, daemon=True).start()
             break
 

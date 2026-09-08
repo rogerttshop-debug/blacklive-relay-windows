@@ -59,7 +59,7 @@ def obfuscate():
         return None
 
     result = subprocess.run(
-        [pyarmor, 'gen', '--output', obf_dir, 'relay_tray.py', 'local_relay.py'],
+        [pyarmor, 'gen', '--output', obf_dir, 'relay_tray.py', 'local_relay.py', 'compose.py'],
         cwd=os.path.dirname(os.path.abspath(__file__))
     )
     if result.returncode != 0:
@@ -106,6 +106,8 @@ def build():
         '--hidden-import=PIL.ImageDraw',
         '--hidden-import=tkinter',
         '--hidden-import=local_relay',
+        '--hidden-import=compose',
+        '--hidden-import=psutil',
         '--hidden-import=json',
         '--hidden-import=json.decoder',
         '--hidden-import=json.encoder',
