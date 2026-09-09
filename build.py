@@ -94,7 +94,8 @@ def build():
 
     args = [
         sys.executable, '-m', 'PyInstaller',
-        '--onefile',
+        ('--onedir' if sys.platform == 'win32' else '--onefile'),
+        '--exclude-module=PIL._avif',
         '--noconsole',
         '--clean',
         f'--name={NOME}',
@@ -144,7 +145,8 @@ def build():
             subprocess.run(['codesign', '--force', '--deep', '--sign', '-', app_path], capture_output=True)
             print(f'\n✅ Mac app gerado: {os.path.abspath(app_path)}')
         elif sys.platform == 'win32':
-            dist_path += '.exe'
+            exe_onedir = os.path.join('dist', NOME, f'{NOME}.exe')
+            dist_path = exe_onedir if os.path.exists(exe_onedir) else dist_path + '.exe'
             print(f'\n✅ Windows exe gerado: {os.path.abspath(dist_path)}')
             print(f'   Tamanho: {os.path.getsize(dist_path) // 1024 // 1024} MB')
     else:
