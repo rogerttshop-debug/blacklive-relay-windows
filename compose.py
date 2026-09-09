@@ -110,6 +110,8 @@ class ComposeSession:
         self.log = log
         self.notify = notify or (lambda m: None)
         self.tmp = tempfile.mkdtemp(prefix="blcompose_")
+        self._sid = os.path.basename(self.tmp).replace("blcompose_", "")   # id curto p/ log por sessao
+        self.logf = os.path.join(os.path.expanduser("~"), ".blacklive_compose_%s.log" % self._sid)
         self.cw, self.ch = CANVAS_W, CANVAS_H   # dimensoes do canvas (o painel manda a altura certa)
         self.media = {}          # media_id -> caminho local do arquivo
         self.proc = None
@@ -537,7 +539,7 @@ class ComposeSession:
         self.stop()
         self.rtmp = rtmp_url
         cmd = self._build_cmd(layers, audio_path, rtmp_url, encoder)
-        logf = os.path.join(os.path.expanduser("~"), ".blacklive_compose.log")
+        logf = self.logf   # log POR SESSAO: varias lives de compose nao sobrescrevem o log uma da outra
         self.log.info("[COMPOSE] iniciando composicao ao vivo (%d camadas)" % len(layers))
         try:
             self.log.info("[COMPOSE] TIPOS recebidos: %s" % ([l.get("type") for l in layers]))
@@ -576,5 +578,10 @@ class ComposeSession:
         self.stop()
         try:
             shutil.rmtree(self.tmp, ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "logf", None) and os.path.exists(self.logf):
+                os.remove(self.logf)
         except Exception:
             pass
