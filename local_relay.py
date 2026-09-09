@@ -25,7 +25,7 @@ import logging
 import threading
 
 PORT    = 8902
-VERSION = "1.8.7"
+VERSION = "1.8.8"
 VPS_URL = "https://blacklive.com.br"
 
 ALLOWED_ORIGINS = {
@@ -495,6 +495,7 @@ async def _handle_compose(websocket):
                     if k in d:
                         cfg[k] = d[k]
                 sess.audio_live = bool(d.get("audio_live"))
+                sess.hwdec = bool(d.get("hwdec"))   # decode por hardware (opt-in por sala, teste)
                 try:
                     sess.ch = int(d.get("canvas_h") or sess.ch)
                     sess.cw = int(d.get("canvas_w") or sess.cw)

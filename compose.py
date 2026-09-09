@@ -42,6 +42,14 @@ def _hwaccel_args():
     return ["-hwaccel", "auto"]
 
 
+def _hwaccel_args_sess(sess):
+    """OPT-IN por sala (teste jberna): decode por hardware no Windows via d3d11va.
+    O painel manda hwdec:true no config; sem a flag, segue o software (robusto)."""
+    if sys.platform.startswith("win") and getattr(sess, "hwdec", False):
+        return ["-hwaccel", "d3d11va"]
+    return _hwaccel_args()
+
+
 def _cam_input(device=None):
     """Entrada de câmera por plataforma (captura LOCAL — não passa pelo navegador).
     thread_queue_size grande + framerate = feed ao vivo sem engasgo/trava."""
@@ -366,7 +374,7 @@ class ComposeSession:
             dims = (720, 1280)   # fallback
 
             if t in ("video",) and path:
-                inputs += ["-stream_loop", "-1"] + _hwaccel_args() + ["-re", "-i", path]  # decode na placa
+                inputs += ["-stream_loop", "-1"] + _hwaccel_args_sess(self) + ["-re", "-i", path]  # decode na placa (hw opt-in por sala)
                 dims = self._dims(path)
                 # áudio do vídeo entra na live se NÃO estiver mudo (audioModo 'live'/'ambos')
                 _am = str(layer.get("audioModo") or ("mudo" if layer.get("muted", True) else "ambos"))
