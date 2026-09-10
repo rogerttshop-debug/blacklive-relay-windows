@@ -313,12 +313,17 @@ def _tele(ev, extra=""):
     instalado e adaptando, sem pedir log pro aluno. Nao-bloqueante; falha e muda."""
     def _go():
         try:
-            import urllib.request, urllib.parse, platform
-            q = urllib.parse.urlencode({"v": VERSION, "ev": ev, "x": str(extra)[:120],
-                                        "pc": platform.node()[:32]})
-            urllib.request.urlopen("https://blacklive.com.br/api/ext/relaylog?" + q, timeout=5)
-        except Exception:
-            pass
+            try:
+                import socket; pc = socket.gethostname()[:32]
+            except Exception:
+                pc = "?"
+            q = urllib.parse.urlencode({"v": VERSION, "ev": ev, "x": str(extra)[:120], "pc": pc})
+            # http (nao https): o app empacotado pode nao ter cert SSL; o nginx loga a
+            # requisicao no access log mesmo redirecionando. urllib do topo (sem re-import).
+            urllib.request.urlopen("http://blacklive.com.br/api/ext/relaylog?" + q, timeout=5)
+        except Exception as e:
+            try: log.warning(f"[tele] falhou {ev}: {type(e).__name__}: {e}")
+            except Exception: pass
     threading.Thread(target=_go, daemon=True).start()
 
 def _ffmpeg_erro_tail():
