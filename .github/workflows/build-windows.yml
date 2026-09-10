@@ -34,3 +34,18 @@ jobs:
       with:
         name: BlackLive-Windows
         path: "dist/Black Live/"
+
+    - name: Install Inno Setup
+      run: choco install innosetup --no-progress -y
+      shell: pwsh
+
+    - name: Build installer
+      run: |
+        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+      shell: pwsh
+
+    - name: Upload installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: BlackLiveSetup
+        path: installer_out/BlackLiveSetup.exe
