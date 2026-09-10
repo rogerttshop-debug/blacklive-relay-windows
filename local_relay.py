@@ -25,7 +25,7 @@ import logging
 import threading
 
 PORT    = 8902
-VERSION = "1.8.8"
+VERSION = "1.9.0"
 VPS_URL = "https://blacklive.com.br"
 
 ALLOWED_ORIGINS = {
@@ -283,6 +283,55 @@ async def handle(websocket):
 def _q_auto_off_path():
     return os.path.join(os.path.expanduser("~"), ".bl_relay_qualidade.auto_off")
 
+# ── v1.9.0 ADAPTATIVO: degraus de qualidade (filosofia OBS/Live Studio) ───────
+# 0=ALTA (1080p/4500k)  1=MEDIA (720p/2500k)  2=ESTAVEL (copy, repassa).
+# Regra de ouro: sob pressao, DESCE um degrau — a live NUNCA fecha por qualidade.
+# O degrau descido fica gravado por 24h (no dia seguinte re-tenta o de cima).
+TIERS = {0: "ALTA 1080p/4500k", 1: "MEDIA 720p/2500k", 2: "ESTAVEL (copy)"}
+
+def _tier_path():
+    return os.path.join(os.path.expanduser("~"), ".bl_relay_tier")
+
+def _tier_ler():
+    try:
+        d = json.load(open(_tier_path()))
+        if time.time() - float(d.get("ts", 0)) < 86400 and int(d.get("tier", 0)) in (1, 2):
+            return int(d["tier"])
+    except Exception:
+        pass
+    return None
+
+def _tier_gravar(t):
+    try:
+        json.dump({"tier": int(t), "ts": time.time()}, open(_tier_path(), "w"))
+    except Exception:
+        pass
+
+def _tele(ev, extra=""):
+    """v1.9.0 TESTE: manda eventos-chave pro servidor (a URL fica no access log —
+    mesmo truque do pictest/hbtick). A gente ve remotamente se o app novo esta
+    instalado e adaptando, sem pedir log pro aluno. Nao-bloqueante; falha e muda."""
+    def _go():
+        try:
+            import urllib.request, urllib.parse, platform
+            q = urllib.parse.urlencode({"v": VERSION, "ev": ev, "x": str(extra)[:120],
+                                        "pc": platform.node()[:32]})
+            urllib.request.urlopen("https://blacklive.com.br/api/ext/relaylog?" + q, timeout=5)
+        except Exception:
+            pass
+    threading.Thread(target=_go, daemon=True).start()
+
+def _ffmpeg_erro_tail():
+    """Ultimas linhas UTEIS do log do ffmpeg (sem frame=) — vai junto na telemetria
+    quando o motor morre, pra vermos O ERRO remotamente sem pedir log ao aluno."""
+    try:
+        p = os.path.join(os.path.expanduser("~"), ".blacklive_ffmpeg.log")
+        data = open(p, "rb").read()[-4000:].decode("utf-8", "replace").replace("\r", "\n")
+        ln = [l.strip() for l in data.split("\n") if l.strip() and not l.startswith("frame=")]
+        return " | ".join(ln[-2:])[:200]
+    except Exception:
+        return ""
+
 def _qualidade_benchmark(enc):
     """v1.6.3: mede se a maquina AGUENTA reencodar 1080p em tempo real (3s de teste
     sintetico com o MESMO filtro/bitrate da transmissao). Precisa de folga (>=1.6x
@@ -305,22 +354,30 @@ def _qualidade_benchmark(enc):
         log.warning(f"[QUALIDADE] benchmark falhou ({e}) -> modo leve (copy)")
         return False
 
-def _qualidade_modo():
-    """v1.6.3: decide 1x por maquina (cache) se reencoda (hq) ou repassa (copy).
-    Ordem: .off manual > .auto_off (fallback ao vivo) > cache > benchmark."""
+def _tier_atual(q_forcado=None):
+    """v1.9.0: decide o DEGRAU da transmissao. Ordem de prioridade:
+    .off manual > pedido do painel (q=alta/estavel) > degrau adaptativo (24h) >
+    .auto_off legado > cache do benchmark > benchmark."""
     off = os.path.join(os.path.expanduser("~"), ".bl_relay_qualidade.off")
     if os.path.exists(off):
-        return "copy", None, "desligado manualmente (.off)"
-    if os.path.exists(_q_auto_off_path()):
-        return "copy", None, "fallback automatico (PC nao acompanhou ao vivo)"
+        return 2, None, "desligado manualmente (.off)"
     enc = leve_detectar_encoder()
     if not enc or enc == "libx264":
-        return "copy", None, "sem encoder de hardware"
+        return 2, None, "sem encoder de hardware"
+    if q_forcado == "estavel":
+        return 2, enc, "painel pediu ESTAVEL"
+    if q_forcado == "alta":
+        return 0, enc, "painel pediu ALTA"
+    t = _tier_ler()
+    if t is not None:
+        return t, enc, "degrau adaptativo (ultimas 24h)"
+    if os.path.exists(_q_auto_off_path()):
+        return 2, enc, "fallback automatico legado (.auto_off)"
     cache = os.path.join(os.path.expanduser("~"), ".bl_relay_qualidade.cache")
     try:
         c = json.load(open(cache))
         if c.get("enc") == enc and c.get("modo") in ("hq", "copy"):
-            return c["modo"], enc, "cache do benchmark"
+            return (0 if c["modo"] == "hq" else 2), enc, "cache do benchmark"
     except Exception:
         pass
     modo = "hq" if _qualidade_benchmark(enc) else "copy"
@@ -328,27 +385,28 @@ def _qualidade_modo():
         json.dump({"enc": enc, "modo": modo}, open(cache, "w"))
     except Exception:
         pass
-    return modo, enc, "benchmark"
+    return (0 if modo == "hq" else 2), enc, "benchmark"
 
-def _build_tx_cmd(rtmp_url):
-    """Monta o comando ffmpeg da transmissao. Retorna (cmd, eh_hq).
-    QUALIDADE (v1.6.3): reencoda 1080p/keyframe2s SO se o benchmark provou que a
-    maquina aguenta em tempo real (placa fraca tipo Intel UHD cai no copy sozinha).
-    Se ainda assim engasgar ao vivo, o fallback grava .auto_off e religa no leve.
-    Desliga manualmente criando ~/.bl_relay_qualidade.off."""
+def _build_tx_cmd(rtmp_url, q_forcado=None):
+    """Monta o comando ffmpeg da transmissao. Retorna (cmd, tier).
+    v1.9.0 ADAPTATIVO: 3 degraus (0=1080p/4500k, 1=720p/2500k, 2=copy). O degrau
+    vem de _tier_atual(); sob pressao ao vivo o _handle_rtmp DESCE um degrau e
+    religa — a live nao fecha por qualidade. Desliga tudo com ~/.bl_relay_qualidade.off."""
     base_meta = [
         "-user_agent", "TikTokLiveStudio/0.46.1",
         "-metadata", "title=TikTok Live Studio",
         "-metadata", "encoder=TikTok Live Studio 0.46.1",
     ]
-    modo, enc, motivo = _qualidade_modo()
-    if modo == "hq":
-        # QUALIDADE por hardware: 1080p (largura), keyframe 2s (30fps -> g=60), bitrate estavel
-        KBPS = 4500
+    tier, enc, motivo = _tier_atual(q_forcado)
+    if tier in (0, 1):
+        # Degrau 0 = 1080p/4500k; degrau 1 = 720p/2500k (alivia encoder E upload).
+        # keyframe 2s (30fps -> g=60), bitrate estavel.
+        KBPS = 4500 if tier == 0 else 2500
+        ESCALA = "1080:-2" if tier == 0 else "720:-2"
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "warning",
                "-fflags", "+genpts+discardcorrupt",
                "-f", "webm", "-i", "pipe:0",
-               "-vf", "scale=1080:-2:flags=bicubic",
+               "-vf", "scale=%s:flags=bicubic" % ESCALA,
                "-r", "30",
                "-c:v", enc,
                "-b:v", "%dk" % KBPS, "-maxrate", "%dk" % KBPS, "-bufsize", "%dk" % (KBPS * 2),
@@ -362,15 +420,15 @@ def _build_tx_cmd(rtmp_url):
             cmd += ["-profile:v", "high"]
         cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "44100"]
         cmd += base_meta + ["-f", "flv", rtmp_url]
-        log.info(f"[QUALIDADE] reencodando 1080p/keyframe2s/{KBPS}k via {enc} ({motivo})")
-        return cmd, True
-    # PC fraco / sem placa / fallback: repasse original (nao mexe na CPU)
-    log.info(f"[QUALIDADE] repassando -c:v copy — {motivo}")
+        log.info(f"[QUALIDADE] degrau {tier} ({TIERS[tier]}) via {enc} ({motivo})")
+        return cmd, tier
+    # Degrau 2: repasse original (nao mexe na CPU)
+    log.info(f"[QUALIDADE] degrau 2 ({TIERS[2]}) — {motivo}")
     return [FFMPEG, "-hide_banner", "-loglevel", "warning",
             "-fflags", "+genpts+discardcorrupt",
             "-f", "webm", "-i", "pipe:0",
             "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100"] + base_meta + ["-f", "flv", rtmp_url], False
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100"] + base_meta + ["-f", "flv", rtmp_url], 2
 
 
 async def _handle_rtmp(websocket, qs):
@@ -394,7 +452,21 @@ async def _handle_rtmp(websocket, qs):
         env["https_proxy"] = f"http://{proxy_url}"
 
     ffmpeg_log = os.path.join(os.path.expanduser("~"), ".blacklive_ffmpeg.log")
-    ffmpeg_cmd, _tx_hq = _build_tx_cmd(rtmp_url)
+    q_forcado = qs.get("q", [None])[0]              # painel pode mandar q=alta / q=estavel
+    ffmpeg_cmd, _tx_tier = _build_tx_cmd(rtmp_url, q_forcado)
+
+    def _degrau_abaixo(motivo_txt):
+        """v1.9.0: desce UM degrau de qualidade (0->1->2) e persiste por 24h.
+        Retorna True se desceu (o chamador mata o ffmpeg e religa)."""
+        if q_forcado in ("alta", "estavel"):
+            return False                             # painel fixou: nao mexe
+        if _tx_tier >= 2:
+            return False                             # ja esta no copy: nada a descer
+        _tier_gravar(_tx_tier + 1)
+        log.warning(f"[ADAPT] {motivo_txt} — descendo p/ degrau {_tx_tier+1} ({TIERS[_tx_tier+1]}); religa ja vem no degrau novo")
+        _tele("adapt_desce", f"de={_tx_tier} para={_tx_tier+1} {motivo_txt}")
+        _notify("⚙️ Ajustei a qualidade pra manter a live estável (religa sozinha)")
+        return True
 
     # v1.6.1: escrita via FILA + thread (nunca trava o relay). Se o ffmpeg ENTALA
     # (vivo mas surdo), a fila enche em ~20s -> mata e fecha a conexao NA HORA.
@@ -425,25 +497,36 @@ async def _handle_rtmp(websocket, qs):
         )
         threading.Thread(target=_writer, args=(proc, fila), daemon=True).start()
         log.info("FFmpeg iniciado (local → TikTok)")
+        _tele("tx_start", f"tier={_tx_tier} key={rtmp_url.split('stream-')[-1].split('?')[0][:22]}")
         await websocket.send(json.dumps({"status": "streaming", "ip": "local"}))
 
+        _press0 = None    # v1.9.0: inicio da pressao sustentada na fila (sensor do adaptativo)
         async for msg in websocket:
             if isinstance(msg, bytes):
                 if proc.poll() is not None:
                     log.warning("FFmpeg morreu — fechando a conexao p/ o painel religar")
+                    _tele("ffmpeg_morreu", _ffmpeg_erro_tail())   # o ERRO real vai junto
                     break
+                # v1.9.0 ADAPT: fila >=10 (~10s de atraso) sustentada por >=6s = este degrau
+                # nao esta escoando -> desce ANTES de entalar de vez (OBS/Live Studio:
+                # baixa a qualidade, nunca derruba a live).
+                _qsz = fila.qsize()
+                if _qsz >= 10 and _tx_tier < 2:
+                    if _press0 is None:
+                        _press0 = time.time()
+                    elif time.time() - _press0 >= 6:
+                        if _degrau_abaixo(f"pressao sustentada (fila={_qsz} por 6s+)"):
+                            try: proc.kill()
+                            except Exception: pass
+                            break
+                else:
+                    _press0 = None
                 try:
                     fila.put_nowait(msg)
                 except _q.Full:
                     log.warning("FFmpeg ENTALADO (fila cheia ~20s) — matando e fechando p/ religar")
-                    if _tx_hq:
-                        # v1.6.3 FALLBACK: a maquina nao acompanhou o reencode 1080p ao vivo.
-                        # Grava o auto_off -> o religa (20s) volta AUTOMATICO no modo leve (copy).
-                        try:
-                            open(_q_auto_off_path(), "w").write("entalou no modo qualidade — modo leve automatico")
-                        except Exception:
-                            pass
-                        _notify("⚠️ Ajustei a qualidade automaticamente (a live religa sozinha)")
+                    _tele("entalo", f"tier={_tx_tier} {_ffmpeg_erro_tail()}")
+                    _degrau_abaixo("entalo (fila cheia)")   # se desceu, o religa ja vem mais leve
                     try: proc.kill()
                     except Exception: pass
                     break
@@ -1137,6 +1220,7 @@ async def main():
 
     _instala_fix_pna()   # Chrome 152+: aceita o preflight de "Acesso a rede local"
     log.info(f"BlackLive Local Relay v{VERSION} iniciado | FFmpeg: {FFMPEG}")
+    _tele("start")   # v1.9.0 TESTE: prova remota de que o app novo foi instalado e abriu
     _kill_compose_leftovers()   # limpa ffmpeg de compose orfao de uma sessao/crash anterior
 
     # Auto-update em background — não bloqueia o start
