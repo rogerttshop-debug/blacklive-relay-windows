@@ -15,7 +15,7 @@ import subprocess
 import shutil
 
 NOME        = 'Black Live'
-VERSAO      = '1.2.0'
+VERSAO      = '1.9.1'
 ENTRY_POINT = 'relay_tray.py'
 ICON_WIN    = 'icon.ico'
 ICON_MAC    = 'icon.icns'
@@ -59,7 +59,7 @@ def obfuscate():
         return None
 
     result = subprocess.run(
-        [pyarmor, 'gen', '--output', obf_dir, 'relay_tray.py', 'local_relay.py'],
+        [pyarmor, 'gen', '--output', obf_dir, 'relay_tray.py', 'local_relay.py', 'compose.py'],
         cwd=os.path.dirname(os.path.abspath(__file__))
     )
     if result.returncode != 0:
@@ -106,16 +106,8 @@ def build():
         '--hidden-import=PIL.ImageDraw',
         '--hidden-import=tkinter',
         '--hidden-import=local_relay',
-        '--hidden-import=json',
-        '--hidden-import=json.decoder',
-        '--hidden-import=json.encoder',
-        '--hidden-import=urllib',
-        '--hidden-import=urllib.request',
-        '--hidden-import=urllib.parse',
-        '--hidden-import=ssl',
-        '--hidden-import=socket',
-        '--hidden-import=threading',
-        '--hidden-import=subprocess',
+        '--hidden-import=compose',
+        f'--paths={work_dir}',
     ]
 
     for src, dst in datas:
